@@ -344,7 +344,7 @@ const LOGIN_HTML = String.raw`<!doctype html>
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>dmzs-drive — sign in</title>
+<title>Damien's Drive — sign in</title>
 <style>
   :root {
     color-scheme: light dark;
@@ -415,8 +415,8 @@ const LOGIN_HTML = String.raw`<!doctype html>
 </head>
 <body>
 <form id="loginForm">
-  <h1>dmzs-drive</h1>
-  <p class="sub">Sign in to your drive</p>
+  <h1>Welcome back, Damien 👋</h1>
+  <p class="sub">Your personal drive</p>
   <label>Password
     <input type="password" id="password" autocomplete="current-password" required autofocus />
   </label>
@@ -460,7 +460,7 @@ const HTML = String.raw`<!doctype html>
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>dmzs-drive</title>
+<title>Damien's Drive</title>
 <style>
   :root {
     color-scheme: light dark;
@@ -548,7 +548,7 @@ const HTML = String.raw`<!doctype html>
 <body>
 <header>
   <div>
-    <h1>dmzs-drive</h1>
+    <h1>Damien's Drive</h1>
     <div id="breadcrumb"></div>
   </div>
   <div class="toolbar">
@@ -609,7 +609,7 @@ function renderBreadcrumb() {
   bc.innerHTML = "";
 
   var root = document.createElement("span");
-  root.textContent = "dmzs-drive";
+  root.textContent = "Home";
   root.onclick = function () { setView(false); load(""); };
   bc.appendChild(root);
 
