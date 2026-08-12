@@ -26,8 +26,14 @@
 import { ICON_192, ICON_512, APPLE_ICON } from "./icons.js";
 
 const TRASH = ".trash/";
+const CONFIG = ".config/"; // hidden technical area (share-link records live here)
+const SHARES = CONFIG + "shares/";
 const SESSION_DAYS = 30;
 const TRASH_RETENTION_DAYS = 30;
+
+function isReserved(key) {
+  return key.startsWith(TRASH) || key.startsWith(CONFIG);
+}
 
 const MANIFEST = {
   name: "Damien's Drive",
@@ -96,11 +102,17 @@ export default {
       if (url.pathname === "/api/rename" && request.method === "POST") {
         return await handleRename(url, env);
       }
-      if (url.pathname === "/api/movedir" && request.method === "POST") {
-        return await handleMoveDir(url, env);
-      }
       if (url.pathname === "/api/keys" && request.method === "GET") {
         return await handleKeys(url, env);
+      }
+      if (url.pathname === "/api/shares" && request.method === "GET") {
+        return await handleSharesList(env);
+      }
+      if (url.pathname === "/api/shares/revoke" && request.method === "POST") {
+        return await handleShareRevoke(url, env);
+      }
+      if (url.pathname === "/api/shares/revokeall" && request.method === "POST") {
+        return await handleShareRevokeAll(env);
       }
       if (url.pathname === "/api/search" && request.method === "GET") {
         return await handleSearch(url, env);
@@ -128,7 +140,7 @@ export default {
     return htmlResponse(HTML);
   },
 
-  // Daily cron: purge trash entries older than the retention window.
+  // Daily cron: purge old trash entries and expired share-link records.
   async scheduled(controller, env) {
     const cutoff = Date.now() - TRASH_RETENTION_DAYS * 86400 * 1000;
     const expired = (await listAllTrash(env))
@@ -136,6 +148,20 @@ export default {
       .map((o) => o.key);
     for (let i = 0; i < expired.length; i += 1000) {
       await env.DRIVE_BUCKET.delete(expired.slice(i, i + 1000));
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    const staleShares = [];
+    let cursor;
+    do {
+      const page = await env.DRIVE_BUCKET.list({ prefix: SHARES, cursor, include: ["customMetadata"] });
+      for (const o of page.objects) {
+        if (parseInt((o.customMetadata || {}).exp || "0", 10) < now) staleShares.push(o.key);
+      }
+      cursor = page.truncated ? page.cursor : undefined;
+    } while (cursor);
+    for (let i = 0; i < staleShares.length; i += 1000) {
+      await env.DRIVE_BUCKET.delete(staleShares.slice(i, i + 1000));
     }
   },
 };
@@ -234,6 +260,21 @@ async function handleSign(url, env) {
   const requested = parseInt(url.searchParams.get("ttl") || "", 10);
   const ttl = Math.min(Math.max(requested || SIGNED_URL_TTL_SECONDS, 60), 7 * 86400);
   const exp = Math.floor(Date.now() / 1000) + ttl;
+
+  if (url.searchParams.get("share") === "1") {
+    // Real share links are recorded (id -> file, expiry, url) so they can be
+    // listed and revoked; deleting the record invalidates the link.
+    const id = crypto.randomUUID();
+    const sig = await hmacHex(sessionKey(env), "url|" + key + "|" + exp + "|" + id);
+    const link =
+      url.origin + "/api/object?key=" + encodeURIComponent(key) +
+      "&view=1&exp=" + exp + "&sid=" + id + "&sig=" + sig;
+    await env.DRIVE_BUCKET.put(SHARES + id, new Uint8Array(), {
+      customMetadata: { key, exp: String(exp), url: link },
+    });
+    return Response.json({ url: link });
+  }
+
   const sig = await hmacHex(sessionKey(env), "url|" + key + "|" + exp);
   return Response.json({
     url:
@@ -247,8 +288,58 @@ async function verifySignedUrl(url, env) {
   const key = url.searchParams.get("key") || "";
   const exp = parseInt(url.searchParams.get("exp") || "", 10);
   if (!exp || Math.floor(Date.now() / 1000) > exp) return false;
+  const sid = url.searchParams.get("sid");
+  if (sid) {
+    // Share link: valid only while its record still exists (revocable).
+    if (!/^[0-9a-f-]{36}$/.test(sid)) return false;
+    const record = await env.DRIVE_BUCKET.head(SHARES + sid);
+    if (!record || (record.customMetadata || {}).key !== key) return false;
+    const expected = await hmacHex(sessionKey(env), "url|" + key + "|" + exp + "|" + sid);
+    return safeEqual(url.searchParams.get("sig") || "", expected);
+  }
   const expected = await hmacHex(sessionKey(env), "url|" + key + "|" + exp);
   return safeEqual(url.searchParams.get("sig") || "", expected);
+}
+
+async function handleSharesList(env) {
+  const shares = [];
+  let cursor;
+  do {
+    const page = await env.DRIVE_BUCKET.list({ prefix: SHARES, cursor, include: ["customMetadata"] });
+    for (const o of page.objects) {
+      const m = o.customMetadata || {};
+      shares.push({
+        id: o.key.slice(SHARES.length),
+        key: m.key || "?",
+        exp: parseInt(m.exp || "0", 10),
+        url: m.url || "",
+      });
+    }
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+  shares.sort((a, b) => a.exp - b.exp);
+  return Response.json({ shares });
+}
+
+async function handleShareRevoke(url, env) {
+  const id = url.searchParams.get("id") || "";
+  if (!/^[0-9a-f-]{36}$/.test(id)) return new Response("Bad id", { status: 400 });
+  await env.DRIVE_BUCKET.delete(SHARES + id);
+  return new Response("OK");
+}
+
+async function handleShareRevokeAll(env) {
+  const keys = [];
+  let cursor;
+  do {
+    const page = await env.DRIVE_BUCKET.list({ prefix: SHARES, cursor });
+    keys.push(...page.objects.map((o) => o.key));
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+  for (let i = 0; i < keys.length; i += 1000) {
+    await env.DRIVE_BUCKET.delete(keys.slice(i, i + 1000));
+  }
+  return Response.json({ revoked: keys.length });
 }
 
 // ---------- TOTP (RFC 6238, SHA-1, 30s steps, 6 digits) ----------
@@ -299,7 +390,7 @@ async function handleList(url, env) {
   const prefix = url.searchParams.get("prefix") || "";
   const listed = await env.DRIVE_BUCKET.list({ prefix, delimiter: "/" });
 
-  const folderNames = (listed.delimitedPrefixes || []).filter((p) => p !== TRASH).sort();
+  const folderNames = (listed.delimitedPrefixes || []).filter((p) => p !== TRASH && p !== CONFIG).sort();
   const files = listed.objects
     .filter((o) => o.key !== prefix) // hide the folder's own zero-byte marker, if any
     .map((o) => ({ key: o.key, size: o.size, uploaded: o.uploaded }))
@@ -314,7 +405,7 @@ async function handleList(url, env) {
     do {
       const page = await env.DRIVE_BUCKET.list({ prefix, cursor });
       for (const o of page.objects) {
-        if (prefix === "" && o.key.startsWith(TRASH)) continue;
+        if (prefix === "" && isReserved(o.key)) continue;
         const rest = o.key.slice(prefix.length);
         const slash = rest.indexOf("/");
         if (slash === -1) continue; // direct file of this level, not in a subfolder
@@ -339,7 +430,7 @@ async function handleList(url, env) {
 async function handleUpload(request, url, env) {
   const key = url.searchParams.get("key");
   if (!key) return new Response("Missing key", { status: 400 });
-  if (key.startsWith(TRASH)) return new Response("Reserved prefix", { status: 400 });
+  if (isReserved(key)) return new Response("Reserved prefix", { status: 400 });
 
   await env.DRIVE_BUCKET.put(key, request.body, {
     httpMetadata: {
@@ -400,7 +491,7 @@ function sniffType(b) {
 async function handleSoftDelete(url, env) {
   const key = url.searchParams.get("key");
   if (!key) return new Response("Missing key", { status: 400 });
-  if (key.startsWith(TRASH)) return new Response("Use /api/trash/*", { status: 400 });
+  if (isReserved(key)) return new Response("Use /api/trash/*", { status: 400 });
   await moveObject(env, key, TRASH + key);
   return new Response("OK");
 }
@@ -410,7 +501,7 @@ async function handleRename(url, env) {
   const from = url.searchParams.get("from");
   const to = url.searchParams.get("to");
   if (!from || !to) return new Response("Missing from/to", { status: 400 });
-  if (from.startsWith(TRASH) || to.startsWith(TRASH)) {
+  if (isReserved(from) || isReserved(to)) {
     return new Response("Reserved prefix", { status: 400 });
   }
   if (from === to) return new Response("OK");
@@ -424,7 +515,7 @@ async function handleRename(url, env) {
 async function handleMkdir(url, env) {
   const key = url.searchParams.get("key");
   if (!key) return new Response("Missing key", { status: 400 });
-  if (key.startsWith(TRASH)) return new Response("Reserved prefix", { status: 400 });
+  if (isReserved(key)) return new Response("Reserved prefix", { status: 400 });
   const folderKey = key.endsWith("/") ? key : key + "/";
   await env.DRIVE_BUCKET.put(folderKey, new Uint8Array());
   return new Response("OK");
@@ -434,7 +525,7 @@ async function handleMkdir(url, env) {
 // folder key-by-key with a progress bar.
 async function handleKeys(url, env) {
   const prefix = url.searchParams.get("prefix") || "";
-  if (prefix.startsWith(TRASH)) return new Response("Reserved prefix", { status: 400 });
+  if (isReserved(prefix)) return new Response("Reserved prefix", { status: 400 });
   const keys = [];
   let cursor;
   do {
@@ -443,44 +534,6 @@ async function handleKeys(url, env) {
     cursor = page.truncated ? page.cursor : undefined;
   } while (cursor);
   return Response.json({ keys });
-}
-
-// Moves a whole "folder" (every object under the prefix) to a new prefix.
-// Conflicting destinations are skipped and reported, so a partial move can
-// simply be re-run.
-async function handleMoveDir(url, env) {
-  const from = url.searchParams.get("from") || "";
-  const to = url.searchParams.get("to") || "";
-  if (!from.endsWith("/") || !to.endsWith("/")) {
-    return new Response("Prefixes must end with /", { status: 400 });
-  }
-  if (from.startsWith(TRASH) || to.startsWith(TRASH)) {
-    return new Response("Reserved prefix", { status: 400 });
-  }
-  if (to === from) return Response.json({ moved: 0, failed: 0 });
-  if (to.startsWith(from)) {
-    return new Response("Cannot move a folder into itself", { status: 400 });
-  }
-
-  const keys = [];
-  let cursor;
-  do {
-    const page = await env.DRIVE_BUCKET.list({ prefix: from, cursor });
-    keys.push(...page.objects.map((o) => o.key));
-    cursor = page.truncated ? page.cursor : undefined;
-  } while (cursor);
-
-  let failed = 0;
-  // Small batches: each move streams get->put concurrently and the runtime
-  // caps simultaneous connections.
-  for (let i = 0; i < keys.length; i += 3) {
-    await Promise.all(keys.slice(i, i + 3).map(async (k) => {
-      const dest = to + k.slice(from.length);
-      if (await env.DRIVE_BUCKET.head(dest)) { failed++; return; }
-      await moveObject(env, k, dest);
-    }));
-  }
-  return Response.json({ moved: keys.length - failed, failed });
 }
 
 // ---------- Search & usage ----------
@@ -493,7 +546,7 @@ async function handleSearch(url, env) {
   do {
     const page = await env.DRIVE_BUCKET.list({ cursor });
     for (const o of page.objects) {
-      if (o.key.startsWith(TRASH) || o.key.endsWith("/")) continue;
+      if (isReserved(o.key) || o.key.endsWith("/")) continue;
       if (o.key.toLowerCase().includes(q)) {
         files.push({ key: o.key, size: o.size, uploaded: o.uploaded });
       }
@@ -511,6 +564,7 @@ async function handleUsage(env) {
     const page = await env.DRIVE_BUCKET.list({ cursor });
     for (const o of page.objects) {
       if (o.key.startsWith(TRASH)) trashBytes += o.size;
+      else if (o.key.startsWith(CONFIG)) continue;
       else if (!o.key.endsWith("/")) { driveBytes += o.size; driveCount++; }
     }
     cursor = page.truncated ? page.cursor : undefined;
@@ -536,7 +590,11 @@ async function handleTrashList(env) {
 async function handleTrashRestore(url, env) {
   const key = url.searchParams.get("key");
   if (!key || !key.startsWith(TRASH)) return new Response("Bad key", { status: 400 });
-  await moveObject(env, key, key.slice(TRASH.length));
+  const dest = key.slice(TRASH.length);
+  if (await env.DRIVE_BUCKET.head(dest)) {
+    return new Response("Target exists", { status: 409 }); // never overwrite silently
+  }
+  await moveObject(env, key, dest);
   return new Response("OK");
 }
 
@@ -789,6 +847,8 @@ const HTML = String.raw`<!doctype html>
   button.danger { color: var(--danger); }
   table { width: 100%; border-collapse: collapse; font-size: 14px; }
   th { text-align: left; color: var(--muted); font-weight: 500; font-size: 12px; padding: 8px; border-bottom: 1px solid var(--border); }
+  th.sortable { cursor: pointer; user-select: none; }
+  th.sortable:hover { color: var(--accent); }
   td { padding: 8px; border-bottom: 1px solid var(--border); }
   tr.row:hover { background: var(--hover); }
   .name { cursor: pointer; overflow-wrap: anywhere; }
@@ -935,6 +995,7 @@ const HTML = String.raw`<!doctype html>
     border-bottom: 1px solid var(--border);
   }
   #previewTitle { font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
+  #previewCount { color: var(--muted); font-size: 12px; margin-left: 8px; white-space: nowrap; }
   #previewBody {
     flex: 1;
     display: flex;
@@ -987,9 +1048,12 @@ const HTML = String.raw`<!doctype html>
     <button id="newFolderBtn">New folder</button>
     <button id="uploadBtn" class="primary">Upload</button>
     <button id="backupBtn">Backup</button>
+    <button id="sharesBtn">Shares</button>
     <button id="trashBtn">Trash</button>
     <button id="backBtn" style="display:none">&larr; Back to files</button>
+    <button id="restoreAllBtn" style="display:none">Restore all</button>
     <button id="emptyTrashBtn" class="danger" style="display:none">Empty trash</button>
+    <button id="revokeAllBtn" class="danger" style="display:none">Revoke all</button>
     <button id="logoutBtn">Log out</button>
     <button id="uploadFolderBtn">Upload folder</button>
     <input id="fileInput" type="file" multiple style="display:none" />
@@ -1009,7 +1073,7 @@ const HTML = String.raw`<!doctype html>
       <button id="bulkClearBtn">Clear</button>
     </div>
     <table id="fileTable">
-      <thead><tr><th class="sel"><input type="checkbox" id="selectAll" /></th><th>Name</th><th class="size">Size</th><th class="date" id="dateHeader">Modified</th><th></th></tr></thead>
+      <thead><tr><th class="sel"><input type="checkbox" id="selectAll" /></th><th id="thName" class="sortable">Name</th><th id="thSize" class="size sortable">Size</th><th class="date sortable" id="dateHeader">Modified</th><th></th></tr></thead>
       <tbody id="rows"></tbody>
     </table>
     <div id="grid"></div>
@@ -1019,8 +1083,10 @@ const HTML = String.raw`<!doctype html>
 <div id="hoverPreview"></div>
 <div id="previewOverlay" style="display:none" tabindex="-1">
   <div id="previewHeader">
-    <span id="previewTitle"></span>
+    <span><span id="previewTitle"></span><span id="previewCount"></span></span>
     <div class="toolbar">
+      <button id="previewPrevBtn" title="Previous (←)">&lsaquo;</button>
+      <button id="previewNextBtn" title="Next (→)">&rsaquo;</button>
       <button id="previewDownloadBtn">Download</button>
       <button id="previewCloseBtn">Close</button>
     </div>
@@ -1036,6 +1102,8 @@ var selected = [];
 var lastFiles = [];
 var searchTimer = null;
 var lastDragEnd = 0;
+var sortBy = "name";
+var sortDir = 1;
 
 function humanSize(bytes) {
   if (bytes === 0) return "0 B";
@@ -1060,19 +1128,52 @@ function setMode(m) {
   mode = m;
   var files = m === "files";
   var trash = m === "trash";
+  var shares = m === "shares";
   document.getElementById("newFolderBtn").style.display = files ? "" : "none";
   document.getElementById("uploadBtn").style.display = files ? "" : "none";
   document.getElementById("uploadFolderBtn").style.display = files ? "" : "none";
   document.getElementById("trashBtn").style.display = trash ? "none" : "";
-  document.getElementById("backBtn").style.display = trash ? "" : "none";
+  document.getElementById("sharesBtn").style.display = shares ? "none" : "";
+  document.getElementById("backBtn").style.display = (trash || shares) ? "" : "none";
+  document.getElementById("restoreAllBtn").style.display = trash ? "" : "none";
   document.getElementById("emptyTrashBtn").style.display = trash ? "" : "none";
+  document.getElementById("revokeAllBtn").style.display = shares ? "" : "none";
   document.getElementById("dropzone").style.display = files ? "" : "none";
-  document.getElementById("dateHeader").textContent = trash ? "Deleted" : "Modified";
-  document.getElementById("selectAll").style.visibility = trash ? "hidden" : "";
+  updateSortHeaders();
+  document.getElementById("selectAll").style.visibility = (trash || m === "shares") ? "hidden" : "";
   document.getElementById("viewToggleBtn").style.display = files ? "" : "none";
   document.getElementById("backupBtn").style.display = files ? "" : "none";
   if (m !== "search") document.getElementById("searchBox").value = "";
   clearSelection();
+}
+
+// ---- Sorting ----
+
+function sortArrow(k) {
+  return sortBy === k ? (sortDir > 0 ? " ▲" : " ▼") : "";
+}
+
+function updateSortHeaders() {
+  var dateLabel = mode === "trash" ? "Deleted" : mode === "shares" ? "Expires" : "Modified";
+  document.getElementById("thName").textContent = "Name" + sortArrow("name");
+  document.getElementById("thSize").textContent = "Size" + sortArrow("size");
+  document.getElementById("dateHeader").textContent = dateLabel + sortArrow("date");
+}
+
+function setSort(key) {
+  if (sortBy === key) { sortDir = -sortDir; } else { sortBy = key; sortDir = 1; }
+  updateSortHeaders();
+  refresh();
+}
+
+function sortList(list, getName, getSize, getDate) {
+  list.sort(function (a, b) {
+    var r;
+    if (sortBy === "size") r = getSize(a) - getSize(b);
+    else if (sortBy === "date") r = new Date(getDate(a) || 0) - new Date(getDate(b) || 0);
+    else r = getName(a).localeCompare(getName(b));
+    return r * sortDir;
+  });
 }
 
 // ---- Multi-select ----
@@ -1124,7 +1225,10 @@ function renderBreadcrumb() {
   if (mode !== "files") {
     bc.appendChild(document.createTextNode(" / "));
     var t = document.createElement("span");
-    t.textContent = mode === "trash" ? "Trash" : 'Search: "' + searchQuery + '"';
+    var label = "Trash";
+    if (mode === "search") label = 'Search: "' + searchQuery + '"';
+    if (mode === "shares") label = "Shared links";
+    t.textContent = label;
     bc.appendChild(t);
     return;
   }
@@ -1213,6 +1317,7 @@ function pushPrefixHash(prefix) {
 
 function applyHash() {
   if (location.hash === "#trash") { setMode("trash"); loadTrash(); return; }
+  if (location.hash === "#shares") { setMode("shares"); loadShares(); return; }
   var prefix = "";
   if (location.hash.indexOf("#/") === 0) prefix = decodeURI(location.hash.slice(2));
   setMode("files");
@@ -1256,6 +1361,14 @@ function load(prefix, fromHistory) {
     .then(checkAuth)
     .then(function (res) { return res.json(); })
     .then(function (data) {
+      sortList(data.folders,
+        function (f) { return f.prefix; },
+        function (f) { return f.size; },
+        function (f) { return f.modified; });
+      sortList(data.files,
+        function (f) { return f.key; },
+        function (f) { return f.size; },
+        function (f) { return f.uploaded; });
       lastFiles = data.files.map(function (f) { return f.key; });
       var style = folderViewStyle(prefix);
       document.getElementById("viewToggleBtn").textContent = style === "grid" ? "List view" : "Grid view";
@@ -1460,6 +1573,10 @@ function loadTrash() {
       rows.innerHTML = "";
 
       lastFiles = [];
+      sortList(data.files,
+        function (f) { return f.original; },
+        function (f) { return f.size; },
+        function (f) { return f.deleted; });
       data.files.forEach(function (file) {
         var tr = makeRow(file.original, "🗑️", humanSize(file.size), humanDate(file.deleted),
           null, [
@@ -1478,7 +1595,45 @@ function loadTrash() {
 function refresh() {
   if (mode === "trash") return loadTrash();
   if (mode === "search") return loadSearch();
+  if (mode === "shares") return loadShares();
   return load(currentPrefix);
+}
+
+function loadShares() {
+  showListLayout();
+  renderBreadcrumb();
+  return fetch("/api/shares")
+    .then(checkAuth)
+    .then(function (res) { return res.json(); })
+    .then(function (data) {
+      if (mode !== "shares") return;
+      var rows = document.getElementById("rows");
+      rows.innerHTML = "";
+      lastFiles = [];
+      var now = Math.floor(Date.now() / 1000);
+      data.shares.forEach(function (s) {
+        var expText = s.exp ? new Date(s.exp * 1000).toLocaleString() : "?";
+        var tr = makeRow(s.key, "🔗", s.exp < now ? "expired" : "active", expText, null, [
+          { label: "Copy link", onClick: function () {
+              if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(s.url);
+              } else {
+                prompt("Copy the share link:", s.url);
+              }
+            } },
+          { label: "Revoke", danger: true, onClick: function () { revokeShare(s.id); } }
+        ]);
+        tr.insertBefore(makeSelTd(null), tr.firstChild);
+        rows.appendChild(tr);
+      });
+      showEmpty(data.shares.length, "No share links. Use a file's Share button to create one.");
+      updateTreeActive();
+    });
+}
+
+function revokeShare(id) {
+  fetch("/api/shares/revoke?id=" + encodeURIComponent(id), { method: "POST" })
+    .then(checkAuth).then(refresh);
 }
 
 // Scrolls to a row (after a rename moved it in the sorted list) and flashes it.
@@ -1568,15 +1723,28 @@ function escFrame(frame) {
     try {
       frame.contentWindow.addEventListener("keydown", function (e) {
         if (e.key === "Escape") closePreview();
+        else if (e.key === "ArrowLeft") stepPreview(-1);
+        else if (e.key === "ArrowRight") stepPreview(1);
       });
     } catch (err) { /* cross-origin frame (Office viewer): ignore */ }
   });
+}
+
+function stepPreview(delta) {
+  if (!previewKey) return;
+  var i = lastFiles.indexOf(previewKey);
+  var j = i + delta;
+  if (i === -1 || j < 0 || j >= lastFiles.length) return;
+  openPreview(lastFiles[j]);
 }
 
 function openPreview(key) {
   hideHoverPreview();
   previewKey = key;
   document.getElementById("previewTitle").textContent = key.split("/").pop();
+  var pos = lastFiles.indexOf(key);
+  document.getElementById("previewCount").textContent =
+    pos === -1 ? "" : (pos + 1) + " / " + lastFiles.length;
   var body = document.getElementById("previewBody");
   body.innerHTML = "";
   document.getElementById("previewOverlay").style.display = "flex";
@@ -1729,10 +1897,11 @@ function moveKeys(keys, destPrefix) {
       done++;
       return Promise.resolve();
     }
-    return fetch("/api/rename?from=" + encodeURIComponent(k) + "&to=" + encodeURIComponent(to), { method: "POST" })
+    return fetchRetry("/api/rename?from=" + encodeURIComponent(k) + "&to=" + encodeURIComponent(to), { method: "POST" })
       .then(checkAuth)
-      .then(function (res) {
-        if (!res.ok) failed++;
+      .then(function (res) { if (!res.ok) failed++; })
+      .catch(function () { failed++; })
+      .then(function () {
         done++;
         setProgress("Moving: " + done + "/" + keys.length, done, keys.length);
       });
@@ -1760,6 +1929,10 @@ function loadSearch() {
       if (mode !== "search") return; // user navigated away while we were fetching
       var rows = document.getElementById("rows");
       rows.innerHTML = "";
+      sortList(data.files,
+        function (f) { return f.key; },
+        function (f) { return f.size; },
+        function (f) { return f.uploaded; });
       lastFiles = data.files.map(function (f) { return f.key; });
 
       data.files.forEach(function (file) {
@@ -1806,7 +1979,7 @@ function shareFile(key) {
   if (hours === null) return;
   var ttl = Math.round(parseFloat(hours) * 3600);
   if (!ttl || ttl < 0) { alert("Invalid duration."); return; }
-  fetch("/api/sign?key=" + encodeURIComponent(key) + "&ttl=" + ttl)
+  fetch("/api/sign?key=" + encodeURIComponent(key) + "&ttl=" + ttl + "&share=1")
     .then(checkAuth)
     .then(function (res) { return res.json(); })
     .then(function (data) {
@@ -1886,9 +2059,12 @@ function backupDrive() {
       if (i >= files.length) { finish(); return; }
       var f = files[i];
       setProgress("Backing up " + (i + 1) + "/" + files.length + ": " + f.key, i, files.length);
-      fetch("/api/object?key=" + encodeURIComponent(f.key))
+      fetchRetry("/api/object?key=" + encodeURIComponent(f.key))
         .then(checkAuth)
-        .then(function (r) { return r.arrayBuffer(); })
+        .then(function (r) {
+          if (!r.ok) throw new Error("HTTP " + r.status);
+          return r.arrayBuffer();
+        })
         .then(function (buf) {
           var data = new Uint8Array(buf);
           var nameBytes = enc.encode(f.key);
@@ -1911,6 +2087,10 @@ function backupDrive() {
           offset += 30 + nameBytes.length + data.length;
           i++;
           next();
+        })
+        .catch(function () {
+          hideProgress();
+          alert("Backup aborted: could not download " + f.key + ". Try again.");
         });
     }
 
@@ -1979,10 +2159,11 @@ function movePrefixWithProgress(srcPrefix, destPrefix, label) {
           (function (k) {
             active++;
             var target = destPrefix + k.slice(srcPrefix.length);
-            fetch("/api/rename?from=" + encodeURIComponent(k) + "&to=" + encodeURIComponent(target), { method: "POST" })
+            fetchRetry("/api/rename?from=" + encodeURIComponent(k) + "&to=" + encodeURIComponent(target), { method: "POST" })
               .then(checkAuth)
-              .then(function (res) {
-                if (!res.ok) failed++;
+              .then(function (res) { if (!res.ok) failed++; })
+              .catch(function () { failed++; })
+              .then(function () {
                 active--;
                 done++;
                 setProgress("Moving " + label + ": " + done + "/" + keys.length, done, keys.length);
@@ -2144,6 +2325,20 @@ function purgeFile(key) {
     .then(checkAuth).then(function () { refreshUsage(); refresh(); });
 }
 
+// fetch with up to 3 attempts on network errors and 5xx responses.
+function fetchRetry(url, opts, tries) {
+  tries = tries === undefined ? 3 : tries;
+  return fetch(url, opts).then(function (res) {
+    if (res.status >= 500 && tries > 1) throw new Error("server " + res.status);
+    return res;
+  }).catch(function (err) {
+    if (tries <= 1) throw err;
+    return new Promise(function (r) { setTimeout(r, 800); }).then(function () {
+      return fetchRetry(url, opts, tries - 1);
+    });
+  });
+}
+
 function setProgress(text, done, total) {
   document.getElementById("progress").textContent = text;
   document.getElementById("progressBarWrap").style.display = "block";
@@ -2159,9 +2354,14 @@ function hideProgress() {
 
 function uploadItems(items) {
   var i = 0;
+  var failed = [];
   function next() {
     if (i >= items.length) {
       hideProgress();
+      if (failed.length) {
+        alert(failed.length + " file(s) failed to upload:\n" + failed.slice(0, 10).join("\n") +
+          (failed.length > 10 ? "\n…" : ""));
+      }
       refreshUsage();
       initTree();
       refresh();
@@ -2169,11 +2369,14 @@ function uploadItems(items) {
     }
     var it = items[i];
     setProgress("Uploading " + (i + 1) + "/" + items.length + ": " + it.relPath, i, items.length);
-    fetch("/api/object?key=" + encodeURIComponent(currentPrefix + it.relPath), {
+    fetchRetry("/api/object?key=" + encodeURIComponent(currentPrefix + it.relPath), {
       method: "PUT",
       headers: { "content-type": it.file.type || "application/octet-stream" },
       body: it.file,
-    }).then(checkAuth).then(function () { i++; next(); });
+    }).then(checkAuth)
+      .then(function (res) { if (!res.ok) failed.push(it.relPath); })
+      .catch(function () { failed.push(it.relPath); })
+      .then(function () { i++; next(); });
   }
   next();
 }
@@ -2233,6 +2436,40 @@ document.getElementById("trashBtn").onclick = function () {
   if (location.hash !== "#trash") history.pushState(null, "", "#trash");
   loadTrash();
 };
+document.getElementById("sharesBtn").onclick = function () {
+  setMode("shares");
+  if (location.hash !== "#shares") history.pushState(null, "", "#shares");
+  loadShares();
+};
+document.getElementById("revokeAllBtn").onclick = function () {
+  if (!confirm("Revoke ALL share links? Anyone using them loses access immediately.")) return;
+  fetch("/api/shares/revokeall", { method: "POST" }).then(checkAuth).then(refresh);
+};
+document.getElementById("restoreAllBtn").onclick = function () {
+  fetch("/api/trash/list").then(checkAuth).then(function (r) { return r.json(); }).then(function (data) {
+    if (!data.files.length) return;
+    if (!confirm("Restore all " + data.files.length + " file(s) from the trash?")) return;
+    var i = 0, failed = 0;
+    function next() {
+      if (i >= data.files.length) {
+        hideProgress();
+        if (failed) alert(failed + " file(s) could not be restored (a file with the same name exists).");
+        refreshUsage();
+        initTree();
+        refresh();
+        return;
+      }
+      var f = data.files[i];
+      setProgress("Restoring " + (i + 1) + "/" + data.files.length + ": " + f.original, i, data.files.length);
+      fetchRetry("/api/trash/restore?key=" + encodeURIComponent(f.key), { method: "POST" })
+        .then(checkAuth)
+        .then(function (res) { if (!res.ok) failed++; })
+        .catch(function () { failed++; })
+        .then(function () { i++; next(); });
+    }
+    next();
+  });
+};
 document.getElementById("backBtn").onclick = function () { setMode("files"); load(currentPrefix); };
 
 document.getElementById("emptyTrashBtn").onclick = function () {
@@ -2276,7 +2513,16 @@ document.getElementById("previewDownloadBtn").onclick = function () { if (previe
 document.getElementById("previewOverlay").addEventListener("click", function (e) {
   if (e.target === document.getElementById("previewBody")) closePreview();
 });
-document.addEventListener("keydown", function (e) { if (e.key === "Escape") closePreview(); });
+document.addEventListener("keydown", function (e) {
+  if (e.key === "Escape") closePreview();
+  else if (previewKey && e.key === "ArrowLeft") stepPreview(-1);
+  else if (previewKey && e.key === "ArrowRight") stepPreview(1);
+});
+document.getElementById("previewPrevBtn").onclick = function () { stepPreview(-1); };
+document.getElementById("previewNextBtn").onclick = function () { stepPreview(1); };
+document.getElementById("thName").onclick = function () { setSort("name"); };
+document.getElementById("thSize").onclick = function () { setSort("size"); };
+document.getElementById("dateHeader").onclick = function () { setSort("date"); };
 
 document.getElementById("searchBox").oninput = function () {
   var box = this;
