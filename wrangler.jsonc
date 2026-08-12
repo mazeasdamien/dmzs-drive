@@ -2,6 +2,12 @@
   "name": "dmzs-drive",
   "main": "src/index.js",
   "compatibility_date": "2026-08-01",
+  "routes": [
+    {
+      "pattern": "drive.agentxr.app",
+      "custom_domain": true
+    }
+  ],
   "r2_buckets": [
     {
       "binding": "DRIVE_BUCKET",
