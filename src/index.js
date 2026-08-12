@@ -892,6 +892,9 @@ const HTML = String.raw`<!doctype html>
   .tile .tname { font-size: 12px; padding: 6px 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .tile .tilecb { position: absolute; top: 6px; left: 6px; display: none; accent-color: var(--accent); }
   .tile:hover .tilecb, .tile .tilecb:checked { display: block; }
+  .tile .tacts { position: absolute; top: 4px; right: 4px; display: none; gap: 2px; }
+  .tile:hover .tacts { display: flex; }
+  .tile .tacts button { padding: 2px 6px; font-size: 12px; border-radius: 5px; background: var(--bg); }
   .tile.droptarget { outline: 2px solid var(--accent); outline-offset: -2px; }
   @keyframes flashRow {
     from { background: rgba(37, 99, 235, .28); }
@@ -1319,6 +1322,19 @@ function renderListRows(data, prefix) {
   });
 }
 
+function tileActions(buttons) {
+  var d = document.createElement("div");
+  d.className = "tacts";
+  buttons.forEach(function (b) {
+    var btn = document.createElement("button");
+    btn.textContent = b.label;
+    btn.title = b.title;
+    btn.onclick = function (e) { e.stopPropagation(); b.onClick(); };
+    d.appendChild(btn);
+  });
+  return d;
+}
+
 function renderGrid(data, prefix) {
   var grid = document.getElementById("grid");
   var imgExts = ["png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "ico"];
@@ -1337,6 +1353,10 @@ function renderGrid(data, prefix) {
     nm.textContent = name;
     nm.title = name;
     tile.appendChild(nm);
+    tile.appendChild(tileActions([
+      { label: "✏️", title: "Rename", onClick: function () { renameFolder(folder); } },
+      { label: "🗑", title: "Delete", onClick: function () { removeFolder(folder); } }
+    ]));
     tile.onclick = function () {
       if (Date.now() - lastDragEnd < 400) return;
       load(folder);
@@ -1380,6 +1400,13 @@ function renderGrid(data, prefix) {
     cb.onchange = function () { toggleSelect(file.key, cb.checked); };
     cb.onclick = function (e) { e.stopPropagation(); };
     tile.appendChild(cb);
+
+    tile.appendChild(tileActions([
+      { label: "🔗", title: "Share", onClick: function () { shareFile(file.key); } },
+      { label: "✏️", title: "Rename", onClick: function () { renameFile(file.key); } },
+      { label: "⬇", title: "Download", onClick: function () { download(file.key); } },
+      { label: "🗑", title: "Delete", onClick: function () { removeFile(file.key); } }
+    ]));
 
     tile.onclick = function () {
       if (Date.now() - lastDragEnd < 400) return;
