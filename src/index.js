@@ -96,6 +96,9 @@ export default {
       if (url.pathname === "/api/rename" && request.method === "POST") {
         return await handleRename(url, env);
       }
+      if (url.pathname === "/api/movedir" && request.method === "POST") {
+        return await handleMoveDir(url, env);
+      }
       if (url.pathname === "/api/search" && request.method === "GET") {
         return await handleSearch(url, env);
       }
@@ -394,6 +397,44 @@ async function handleMkdir(url, env) {
   const folderKey = key.endsWith("/") ? key : key + "/";
   await env.DRIVE_BUCKET.put(folderKey, new Uint8Array());
   return new Response("OK");
+}
+
+// Moves a whole "folder" (every object under the prefix) to a new prefix.
+// Conflicting destinations are skipped and reported, so a partial move can
+// simply be re-run.
+async function handleMoveDir(url, env) {
+  const from = url.searchParams.get("from") || "";
+  const to = url.searchParams.get("to") || "";
+  if (!from.endsWith("/") || !to.endsWith("/")) {
+    return new Response("Prefixes must end with /", { status: 400 });
+  }
+  if (from.startsWith(TRASH) || to.startsWith(TRASH)) {
+    return new Response("Reserved prefix", { status: 400 });
+  }
+  if (to === from) return Response.json({ moved: 0, failed: 0 });
+  if (to.startsWith(from)) {
+    return new Response("Cannot move a folder into itself", { status: 400 });
+  }
+
+  const keys = [];
+  let cursor;
+  do {
+    const page = await env.DRIVE_BUCKET.list({ prefix: from, cursor });
+    keys.push(...page.objects.map((o) => o.key));
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+
+  let failed = 0;
+  // Small batches: each move streams get->put concurrently and the runtime
+  // caps simultaneous connections.
+  for (let i = 0; i < keys.length; i += 3) {
+    await Promise.all(keys.slice(i, i + 3).map(async (k) => {
+      const dest = to + k.slice(from.length);
+      if (await env.DRIVE_BUCKET.head(dest)) { failed++; return; }
+      await moveObject(env, k, dest);
+    }));
+  }
+  return Response.json({ moved: keys.length - failed, failed });
 }
 
 // ---------- Search & usage ----------
@@ -1041,6 +1082,12 @@ function load(prefix) {
         ]);
         makeDropTarget(tr, folder);
         tr.insertBefore(makeSelTd(null), tr.firstChild);
+        tr.draggable = true;
+        tr.addEventListener("dragstart", function (e) {
+          e.dataTransfer.setData("application/x-drive-dir", folder);
+          e.dataTransfer.effectAllowed = "move";
+        });
+        tr.addEventListener("dragend", function () { lastDragEnd = Date.now(); });
         rows.appendChild(tr);
       });
 
@@ -1352,24 +1399,48 @@ function refreshUsage() {
     });
 }
 
-function isFileDrag(e) {
-  return Array.prototype.indexOf.call(e.dataTransfer.types, "application/x-drive-key") !== -1;
+function dragKind(e) {
+  var t = e.dataTransfer.types;
+  if (Array.prototype.indexOf.call(t, "application/x-drive-key") !== -1) return "file";
+  if (Array.prototype.indexOf.call(t, "application/x-drive-dir") !== -1) return "dir";
+  return null;
+}
+
+function moveDir(srcPrefix, destPrefix) {
+  if (!srcPrefix) return;
+  var name = srcPrefix.replace(/\/$/, "").split("/").pop();
+  var to = destPrefix + name + "/";
+  if (to === srcPrefix) return;
+  if (to.indexOf(srcPrefix) === 0) { alert("Cannot move a folder inside itself."); return; }
+  fetch("/api/movedir?from=" + encodeURIComponent(srcPrefix) + "&to=" + encodeURIComponent(to), { method: "POST" })
+    .then(checkAuth)
+    .then(function (res) { return res.ok ? res.json() : { failed: 0 }; })
+    .then(function (r) {
+      if (r.failed) alert(r.failed + " item(s) could not be moved (name conflicts) and stayed in place.");
+      initTree();
+      refresh();
+    });
 }
 
 function makeDropTarget(el, destPrefix) {
   el.addEventListener("dragover", function (e) {
-    if (!isFileDrag(e)) return;
+    if (!dragKind(e)) return;
     e.preventDefault();
     e.dataTransfer.dropEffect = "move";
     el.classList.add("droptarget");
   });
   el.addEventListener("dragleave", function () { el.classList.remove("droptarget"); });
   el.addEventListener("drop", function (e) {
-    if (!isFileDrag(e)) return;
+    var kind = dragKind(e);
+    if (!kind) return;
     e.preventDefault();
     e.stopPropagation();
     el.classList.remove("droptarget");
-    moveFile(e.dataTransfer.getData("application/x-drive-key"), destPrefix);
+    if (kind === "file") {
+      moveFile(e.dataTransfer.getData("application/x-drive-key"), destPrefix);
+    } else {
+      moveDir(e.dataTransfer.getData("application/x-drive-dir"), destPrefix);
+    }
   });
 }
 
