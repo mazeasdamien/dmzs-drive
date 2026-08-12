@@ -2038,7 +2038,7 @@ function makeDropTarget(el, destPrefix) {
 
 // ---- Folder tree (lazy-loaded) ----
 
-function treeNode(prefix, name, autoExpand) {
+function treeNode(prefix, name, depth) {
   var wrap = document.createElement("div");
   var row = document.createElement("div");
   row.className = "treeRow";
@@ -2074,9 +2074,7 @@ function treeNode(prefix, name, autoExpand) {
       .then(function (res) { return res.json(); })
       .then(function (data) {
         data.folders.forEach(function (sub) {
-          // Children start collapsed: the tree shows two levels by default,
-          // deeper ones open on demand via the arrows.
-          children.appendChild(treeNode(sub.prefix, sub.prefix.slice(prefix.length).replace(/\/$/, "")));
+          children.appendChild(treeNode(sub.prefix, sub.prefix.slice(prefix.length).replace(/\/$/, ""), depth + 1));
         });
         if (data.folders.length === 0) arrow.style.visibility = "hidden";
       });
@@ -2087,14 +2085,15 @@ function treeNode(prefix, name, autoExpand) {
 
   wrap.appendChild(row);
   wrap.appendChild(children);
-  if (autoExpand) arrow.onclick(new Event("click"));
+  // Auto-expand the first three levels; deeper branches open via the arrows.
+  if (depth < 3) arrow.onclick(new Event("click"));
   return wrap;
 }
 
 function initTree() {
   var tree = document.getElementById("tree");
   tree.innerHTML = "";
-  tree.appendChild(treeNode("", "Home", true));
+  tree.appendChild(treeNode("", "Home", 1));
 }
 
 function updateTreeActive() {
