@@ -772,6 +772,11 @@ const HTML = String.raw`<!doctype html>
   .sel { width: 26px; }
   .sel input { accent-color: var(--accent); }
   tr.droptarget { outline: 2px solid var(--accent); outline-offset: -2px; }
+  @keyframes flashRow {
+    from { background: rgba(37, 99, 235, .28); }
+    to { background: transparent; }
+  }
+  tr.flash { animation: flashRow 1.6s ease-out; }
   #breadcrumb span.droptarget, .treeRow.droptarget { color: var(--accent); background: var(--hover); }
   #previewOverlay {
     position: fixed;
@@ -1051,6 +1056,7 @@ function load(prefix) {
             { label: "Delete", onClick: function () { removeFile(file.key); } }
           ]);
         tr.insertBefore(makeSelTd(file.key), tr.firstChild);
+        tr.dataset.key = file.key;
         tr.draggable = true;
         tr.addEventListener("dragstart", function (e) {
           e.dataTransfer.setData("application/x-drive-key", file.key);
@@ -1094,6 +1100,18 @@ function refresh() {
   if (mode === "trash") return loadTrash();
   if (mode === "search") return loadSearch();
   return load(currentPrefix);
+}
+
+// Scrolls to a row (after a rename moved it in the sorted list) and flashes it.
+function highlightKey(key) {
+  var trs = document.querySelectorAll("#rows tr");
+  Array.prototype.forEach.call(trs, function (tr) {
+    if (tr.dataset.key === key) {
+      tr.scrollIntoView({ block: "center", behavior: "smooth" });
+      tr.classList.add("flash");
+      setTimeout(function () { tr.classList.remove("flash"); }, 1700);
+    }
+  });
 }
 
 function download(key) {
@@ -1223,7 +1241,8 @@ function renameFile(key) {
       .then(checkAuth)
       .then(function (res) {
         if (res.status === 409) alert("A file named " + newName + " already exists here.");
-        refresh();
+        var p = refresh();
+        if (p && p.then) p.then(function () { highlightKey(to); });
       });
   };
 
@@ -1287,6 +1306,7 @@ function loadSearch() {
             { label: "Delete", onClick: function () { removeFile(file.key); } }
           ]);
         tr.insertBefore(makeSelTd(file.key), tr.firstChild);
+        tr.dataset.key = file.key;
         tr.draggable = true;
         tr.addEventListener("dragstart", function (e) {
           e.dataTransfer.setData("application/x-drive-key", file.key);
