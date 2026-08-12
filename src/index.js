@@ -35,6 +35,13 @@ export default {
       return handleLogin(request, env);
     }
 
+    // Time-limited signed links: lets the Office preview's external viewer
+    // fetch a document without our session cookie. Signed, single-file, 5 min.
+    if (url.pathname === "/api/object" && request.method === "GET" && url.searchParams.has("sig")) {
+      if (await verifySignedUrl(url, env)) return handleDownload(url, env);
+      return new Response("Invalid or expired link", { status: 403 });
+    }
+
     if (!(await isAuthed(request, env))) {
       if (url.pathname.startsWith("/api/")) {
         return new Response("Unauthorized", { status: 401 });
@@ -56,6 +63,12 @@ export default {
       }
       if (url.pathname === "/api/mkdir" && request.method === "POST") {
         return await handleMkdir(url, env);
+      }
+      if (url.pathname === "/api/sign" && request.method === "GET") {
+        return await handleSign(url, env);
+      }
+      if (url.pathname === "/api/rename" && request.method === "POST") {
+        return await handleRename(url, env);
       }
       if (url.pathname === "/api/trash/list" && request.method === "GET") {
         return await handleTrashList(env);
@@ -165,6 +178,31 @@ async function safeEqual(a, b) {
   return diff === 0;
 }
 
+// ---------- Signed URLs ----------
+
+const SIGNED_URL_TTL_SECONDS = 300;
+
+async function handleSign(url, env) {
+  const key = url.searchParams.get("key");
+  if (!key) return new Response("Missing key", { status: 400 });
+  const exp = Math.floor(Date.now() / 1000) + SIGNED_URL_TTL_SECONDS;
+  const sig = await hmacHex(sessionKey(env), "url|" + key + "|" + exp);
+  return Response.json({
+    url:
+      url.origin + "/api/object?key=" + encodeURIComponent(key) +
+      "&view=1&exp=" + exp + "&sig=" + sig,
+  });
+}
+
+async function verifySignedUrl(url, env) {
+  if (!env.AUTH_PASS || !env.TOTP_SECRET) return false;
+  const key = url.searchParams.get("key") || "";
+  const exp = parseInt(url.searchParams.get("exp") || "", 10);
+  if (!exp || Math.floor(Date.now() / 1000) > exp) return false;
+  const expected = await hmacHex(sessionKey(env), "url|" + key + "|" + exp);
+  return safeEqual(url.searchParams.get("sig") || "", expected);
+}
+
 // ---------- TOTP (RFC 6238, SHA-1, 30s steps, 6 digits) ----------
 
 async function verifyTotp(secretB32, code) {
@@ -250,8 +288,11 @@ async function handleDownload(url, env) {
     // Inline viewing (PDFs, images, text render natively in the browser).
     // Script-capable types are downgraded to plain text so an uploaded HTML/SVG
     // file can never run JavaScript inside the drive's origin.
+    // (careful: Office mime types contain "openxmlformats" — don't match those)
     const ct = (headers.get("content-type") || "").toLowerCase();
-    if (ct.includes("html") || ct.includes("svg") || ct.includes("xml")) {
+    const scriptCapable = ct.includes("html") || ct.includes("svg") ||
+      ct.startsWith("text/xml") || ct.startsWith("application/xml") || ct.includes("+xml");
+    if (scriptCapable) {
       headers.set("content-type", "text/plain;charset=UTF-8");
     }
     headers.set("Content-Disposition", `inline; filename="${filename}"`);
@@ -266,6 +307,22 @@ async function handleSoftDelete(url, env) {
   if (!key) return new Response("Missing key", { status: 400 });
   if (key.startsWith(TRASH)) return new Response("Use /api/trash/*", { status: 400 });
   await moveObject(env, key, TRASH + key);
+  return new Response("OK");
+}
+
+// Rename and move share this: both are "move object to a new key".
+async function handleRename(url, env) {
+  const from = url.searchParams.get("from");
+  const to = url.searchParams.get("to");
+  if (!from || !to) return new Response("Missing from/to", { status: 400 });
+  if (from.startsWith(TRASH) || to.startsWith(TRASH)) {
+    return new Response("Reserved prefix", { status: 400 });
+  }
+  if (from === to) return new Response("OK");
+  if (await env.DRIVE_BUCKET.head(to)) {
+    return new Response("Target exists", { status: 409 }); // never overwrite silently
+  }
+  await moveObject(env, from, to);
   return new Response("OK");
 }
 
@@ -550,6 +607,65 @@ const HTML = String.raw`<!doctype html>
   .actions button { padding: 3px 8px; font-size: 12px; margin-left: 4px; }
   #empty { color: var(--muted); text-align: center; padding: 40px 0; }
   #progress { font-size: 13px; color: var(--muted); margin-bottom: 12px; }
+  #layout { display: flex; }
+  #sidebar {
+    width: 220px;
+    flex-shrink: 0;
+    border-right: 1px solid var(--border);
+    padding: 12px 8px;
+    overflow-y: auto;
+  }
+  .treeRow {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 6px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13.5px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .treeRow:hover { background: var(--hover); }
+  .treeRow.active { background: var(--hover); color: var(--accent); font-weight: 600; }
+  .treeRow .arrow { width: 14px; flex-shrink: 0; text-align: center; color: var(--muted); }
+  .treeChildren { margin-left: 14px; }
+  .treeEmpty { color: var(--muted); font-size: 12px; padding: 2px 8px 2px 24px; }
+  tr.droptarget { outline: 2px solid var(--accent); outline-offset: -2px; }
+  #breadcrumb span.droptarget, .treeRow.droptarget { color: var(--accent); background: var(--hover); }
+  #previewOverlay {
+    position: fixed;
+    inset: 0;
+    z-index: 10;
+    background: rgba(0, 0, 0, .78);
+    display: flex;
+    flex-direction: column;
+  }
+  #previewHeader {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 10px 16px;
+    background: var(--bg);
+    border-bottom: 1px solid var(--border);
+  }
+  #previewTitle { font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
+  #previewBody {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: auto;
+  }
+  #previewBody iframe { width: 100%; height: 100%; border: none; background: white; }
+  #previewBody img { max-width: 95%; max-height: 95%; object-fit: contain; }
+  #previewBody video { max-width: 95%; max-height: 95%; }
+  .noPreview { color: #eee; text-align: center; padding: 24px; }
+  @media (max-width: 700px) {
+    #sidebar { display: none; }
+  }
   @media (max-width: 600px) {
     header { padding: 12px 16px; }
     main { padding: 16px; }
@@ -573,18 +689,32 @@ const HTML = String.raw`<!doctype html>
     <input id="fileInput" type="file" multiple style="display:none" />
   </div>
 </header>
-<main>
-  <div id="dropzone">Drag files here, or click Upload</div>
-  <div id="progress"></div>
-  <table>
-    <thead><tr><th>Name</th><th class="size">Size</th><th class="date" id="dateHeader">Modified</th><th></th></tr></thead>
-    <tbody id="rows"></tbody>
-  </table>
-  <div id="empty" style="display:none"></div>
-</main>
+<div id="layout">
+  <nav id="sidebar"><div id="tree"></div></nav>
+  <main>
+    <div id="dropzone">Drag files here, or click Upload</div>
+    <div id="progress"></div>
+    <table>
+      <thead><tr><th>Name</th><th class="size">Size</th><th class="date" id="dateHeader">Modified</th><th></th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div id="empty" style="display:none"></div>
+  </main>
+</div>
+<div id="previewOverlay" style="display:none">
+  <div id="previewHeader">
+    <span id="previewTitle"></span>
+    <div class="toolbar">
+      <button id="previewDownloadBtn">Download</button>
+      <button id="previewCloseBtn">Close</button>
+    </div>
+  </div>
+  <div id="previewBody"></div>
+</div>
 <script>
 var currentPrefix = "";
 var inTrash = false;
+var previewKey = null;
 
 function humanSize(bytes) {
   if (bytes === 0) return "0 B";
@@ -623,6 +753,7 @@ function renderBreadcrumb() {
   var root = document.createElement("span");
   root.textContent = "Home";
   root.onclick = function () { setView(false); load(""); };
+  makeDropTarget(root, "");
   bc.appendChild(root);
 
   if (inTrash) {
@@ -641,6 +772,7 @@ function renderBreadcrumb() {
     el.textContent = p;
     var prefixCopy = acc;
     el.onclick = function () { load(prefixCopy); };
+    makeDropTarget(el, prefixCopy);
     bc.appendChild(el);
   });
 }
@@ -697,21 +829,31 @@ function load(prefix) {
 
       data.folders.forEach(function (folder) {
         var name = folder.slice(prefix.length).replace(/\/$/, "");
-        rows.appendChild(makeRow(name, "📁", "", "", function () { load(folder); }, [
+        var tr = makeRow(name, "📁", "", "", function () { load(folder); }, [
           { label: "Delete", onClick: function () { removeFolder(folder); } }
-        ]));
+        ]);
+        makeDropTarget(tr, folder);
+        rows.appendChild(tr);
       });
 
       data.files.forEach(function (file) {
         var name = file.key.slice(prefix.length);
-        rows.appendChild(makeRow(name, "📄", humanSize(file.size), humanDate(file.uploaded),
-          function () { view(file.key); }, [
+        var tr = makeRow(name, "📄", humanSize(file.size), humanDate(file.uploaded),
+          function () { openPreview(file.key); }, [
+            { label: "Rename", onClick: function () { renameFile(file.key); } },
             { label: "Download", onClick: function () { download(file.key); } },
             { label: "Delete", onClick: function () { removeFile(file.key); } }
-          ]));
+          ]);
+        tr.draggable = true;
+        tr.addEventListener("dragstart", function (e) {
+          e.dataTransfer.setData("application/x-drive-key", file.key);
+          e.dataTransfer.effectAllowed = "move";
+        });
+        rows.appendChild(tr);
       });
 
       showEmpty(data.folders.length + data.files.length, "This folder is empty.");
+      updateTreeActive();
     });
 }
 
@@ -733,6 +875,7 @@ function loadTrash() {
       });
 
       showEmpty(data.files.length, "Trash is empty. Deleted files are kept here for 30 days.");
+      updateTreeActive();
     });
 }
 
@@ -742,8 +885,197 @@ function download(key) {
   window.location = "/api/object?key=" + encodeURIComponent(key);
 }
 
-function view(key) {
-  window.open("/api/object?key=" + encodeURIComponent(key) + "&view=1", "_blank");
+// ---- In-page preview ----
+
+function extOf(key) {
+  var name = key.split("/").pop();
+  var dot = name.lastIndexOf(".");
+  return dot === -1 ? "" : name.slice(dot + 1).toLowerCase();
+}
+
+function closePreview() {
+  previewKey = null;
+  document.getElementById("previewOverlay").style.display = "none";
+  document.getElementById("previewBody").innerHTML = ""; // also stops any playing media
+}
+
+function openPreview(key) {
+  previewKey = key;
+  document.getElementById("previewTitle").textContent = key.split("/").pop();
+  var body = document.getElementById("previewBody");
+  body.innerHTML = "";
+  document.getElementById("previewOverlay").style.display = "flex";
+
+  var inlineUrl = "/api/object?key=" + encodeURIComponent(key) + "&view=1";
+  var ext = extOf(key);
+  var images = ["png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "ico"];
+  var texts = ["txt", "md", "csv", "json", "js", "css", "html", "htm", "xml", "svg", "log", "yml", "yaml", "ini", "py", "sh"];
+  var office = ["doc", "docx", "xls", "xlsx", "ppt", "pptx"];
+  var audios = ["mp3", "wav", "m4a", "ogg", "flac"];
+  var videos = ["mp4", "webm", "mov", "m4v"];
+
+  if (images.indexOf(ext) !== -1) {
+    var img = document.createElement("img");
+    img.src = inlineUrl;
+    body.appendChild(img);
+  } else if (ext === "pdf" || texts.indexOf(ext) !== -1) {
+    var frame = document.createElement("iframe");
+    frame.src = inlineUrl;
+    body.appendChild(frame);
+  } else if (audios.indexOf(ext) !== -1) {
+    var au = document.createElement("audio");
+    au.controls = true;
+    au.src = inlineUrl;
+    body.appendChild(au);
+  } else if (videos.indexOf(ext) !== -1) {
+    var vid = document.createElement("video");
+    vid.controls = true;
+    vid.src = inlineUrl;
+    body.appendChild(vid);
+  } else if (office.indexOf(ext) !== -1) {
+    // Microsoft's embedded viewer needs a link it can fetch itself, so ask the
+    // Worker for a short-lived signed URL first.
+    var note = document.createElement("div");
+    note.className = "noPreview";
+    note.textContent = "Loading preview…";
+    body.appendChild(note);
+    fetch("/api/sign?key=" + encodeURIComponent(key))
+      .then(checkAuth)
+      .then(function (res) { return res.json(); })
+      .then(function (data) {
+        if (previewKey !== key) return; // preview was closed meanwhile
+        body.innerHTML = "";
+        var frame = document.createElement("iframe");
+        frame.src = "https://view.officeapps.live.com/op/embed.aspx?src=" + encodeURIComponent(data.url);
+        body.appendChild(frame);
+      });
+  } else {
+    var msg = document.createElement("div");
+    msg.className = "noPreview";
+    msg.textContent = "No preview available for this file type.";
+    body.appendChild(msg);
+  }
+}
+
+// ---- Rename / move ----
+
+function renameFile(key) {
+  var oldName = key.split("/").pop();
+  var newName = prompt("Rename to:", oldName);
+  if (!newName || newName === oldName) return;
+  if (newName.indexOf("/") !== -1) { alert("The name cannot contain /"); return; }
+  var to = key.slice(0, key.length - oldName.length) + newName;
+  fetch("/api/rename?from=" + encodeURIComponent(key) + "&to=" + encodeURIComponent(to), { method: "POST" })
+    .then(checkAuth)
+    .then(function (res) {
+      if (res.status === 409) alert("A file named " + newName + " already exists here.");
+      refresh();
+    });
+}
+
+function moveFile(key, destPrefix) {
+  if (!key) return;
+  var name = key.split("/").pop();
+  var to = destPrefix + name;
+  if (to === key) return;
+  fetch("/api/rename?from=" + encodeURIComponent(key) + "&to=" + encodeURIComponent(to), { method: "POST" })
+    .then(checkAuth)
+    .then(function (res) {
+      if (res.status === 409) alert("Something named " + name + " already exists there.");
+      refresh();
+    });
+}
+
+function isFileDrag(e) {
+  return Array.prototype.indexOf.call(e.dataTransfer.types, "application/x-drive-key") !== -1;
+}
+
+function makeDropTarget(el, destPrefix) {
+  el.addEventListener("dragover", function (e) {
+    if (!isFileDrag(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    el.classList.add("droptarget");
+  });
+  el.addEventListener("dragleave", function () { el.classList.remove("droptarget"); });
+  el.addEventListener("drop", function (e) {
+    if (!isFileDrag(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    el.classList.remove("droptarget");
+    moveFile(e.dataTransfer.getData("application/x-drive-key"), destPrefix);
+  });
+}
+
+// ---- Folder tree (lazy-loaded) ----
+
+function treeNode(prefix, name, autoExpand) {
+  var wrap = document.createElement("div");
+  var row = document.createElement("div");
+  row.className = "treeRow";
+  row.dataset.prefix = prefix;
+
+  var arrow = document.createElement("span");
+  arrow.className = "arrow";
+  arrow.textContent = "▸";
+  row.appendChild(arrow);
+
+  var label = document.createElement("span");
+  label.textContent = (prefix === "" ? "🏠 " : "📁 ") + name;
+  row.appendChild(label);
+
+  var children = document.createElement("div");
+  children.className = "treeChildren";
+  children.style.display = "none";
+  var loaded = false;
+
+  arrow.onclick = function (e) {
+    e.stopPropagation();
+    if (children.style.display !== "none") {
+      children.style.display = "none";
+      arrow.textContent = "▸";
+      return;
+    }
+    children.style.display = "";
+    arrow.textContent = "▾";
+    if (loaded) return;
+    loaded = true;
+    fetch("/api/list?prefix=" + encodeURIComponent(prefix))
+      .then(checkAuth)
+      .then(function (res) { return res.json(); })
+      .then(function (data) {
+        data.folders.forEach(function (sub) {
+          children.appendChild(treeNode(sub, sub.slice(prefix.length).replace(/\/$/, "")));
+        });
+        if (data.folders.length === 0) {
+          var none = document.createElement("div");
+          none.className = "treeEmpty";
+          none.textContent = "no subfolders";
+          children.appendChild(none);
+        }
+      });
+  };
+
+  row.onclick = function () { setView(false); load(prefix); };
+  makeDropTarget(row, prefix);
+
+  wrap.appendChild(row);
+  wrap.appendChild(children);
+  if (autoExpand) arrow.onclick(new Event("click"));
+  return wrap;
+}
+
+function initTree() {
+  var tree = document.getElementById("tree");
+  tree.innerHTML = "";
+  tree.appendChild(treeNode("", "Home", true));
+}
+
+function updateTreeActive() {
+  var rowsEls = document.querySelectorAll(".treeRow");
+  Array.prototype.forEach.call(rowsEls, function (r) {
+    r.classList.toggle("active", !inTrash && r.dataset.prefix === currentPrefix);
+  });
 }
 
 function removeFile(key) {
@@ -754,7 +1086,7 @@ function removeFile(key) {
 
 function removeFolder(prefix) {
   if (!confirm("Move folder " + prefix + " and everything inside it to the trash?")) return;
-  deleteFolderContents(prefix).then(refresh);
+  deleteFolderContents(prefix).then(function () { initTree(); refresh(); });
 }
 
 // Recursively soft-deletes everything under prefix, then the folder marker itself.
@@ -816,7 +1148,7 @@ document.getElementById("newFolderBtn").onclick = function () {
   var name = prompt("Folder name:");
   if (!name) return;
   fetch("/api/mkdir?key=" + encodeURIComponent(currentPrefix + name + "/"), { method: "POST" })
-    .then(checkAuth).then(refresh);
+    .then(checkAuth).then(function () { initTree(); refresh(); });
 };
 
 document.getElementById("trashBtn").onclick = function () { setView(true); loadTrash(); };
@@ -838,9 +1170,19 @@ var dropzone = document.getElementById("dropzone");
 ["dragleave", "drop"].forEach(function (evt) {
   dropzone.addEventListener(evt, function (e) { e.preventDefault(); dropzone.classList.remove("drag"); });
 });
-dropzone.addEventListener("drop", function (e) { uploadFiles(e.dataTransfer.files); });
+dropzone.addEventListener("drop", function (e) {
+  if (e.dataTransfer.files.length) uploadFiles(e.dataTransfer.files);
+});
+
+document.getElementById("previewCloseBtn").onclick = closePreview;
+document.getElementById("previewDownloadBtn").onclick = function () { if (previewKey) download(previewKey); };
+document.getElementById("previewOverlay").addEventListener("click", function (e) {
+  if (e.target === document.getElementById("previewBody")) closePreview();
+});
+document.addEventListener("keydown", function (e) { if (e.key === "Escape") closePreview(); });
 
 setView(false);
+initTree();
 load("");
 </script>
 </body>
