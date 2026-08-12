@@ -427,7 +427,7 @@ const LOGIN_HTML = String.raw`<!doctype html>
 </head>
 <body>
 <form id="loginForm">
-  <h1>Welcome back, Damien 👋</h1>
+  <h1>Welcome back 👋</h1>
   <p class="sub">Your personal drive</p>
   <label>Password
     <input type="password" id="password" autocomplete="current-password" required autofocus />
