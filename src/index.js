@@ -296,11 +296,39 @@ async function handleList(url, env) {
   const prefix = url.searchParams.get("prefix") || "";
   const listed = await env.DRIVE_BUCKET.list({ prefix, delimiter: "/" });
 
-  const folders = (listed.delimitedPrefixes || []).filter((p) => p !== TRASH).sort();
+  const folderNames = (listed.delimitedPrefixes || []).filter((p) => p !== TRASH).sort();
   const files = listed.objects
     .filter((o) => o.key !== prefix) // hide the folder's own zero-byte marker, if any
     .map((o) => ({ key: o.key, size: o.size, uploaded: o.uploaded }))
     .sort((a, b) => a.key.localeCompare(b.key));
+
+  // R2 "folders" are just key prefixes with no metadata of their own, so
+  // aggregate each subfolder's total size and most recent change from a full
+  // (non-delimited) listing of the subtree.
+  const stats = {};
+  if (folderNames.length) {
+    let cursor;
+    do {
+      const page = await env.DRIVE_BUCKET.list({ prefix, cursor });
+      for (const o of page.objects) {
+        if (prefix === "" && o.key.startsWith(TRASH)) continue;
+        const rest = o.key.slice(prefix.length);
+        const slash = rest.indexOf("/");
+        if (slash === -1) continue; // direct file of this level, not in a subfolder
+        const folder = prefix + rest.slice(0, slash + 1);
+        const s = stats[folder] || (stats[folder] = { size: 0, count: 0, modified: null });
+        if (!o.key.endsWith("/")) { s.size += o.size; s.count++; }
+        if (!s.modified || o.uploaded > s.modified) s.modified = o.uploaded;
+      }
+      cursor = page.truncated ? page.cursor : undefined;
+    } while (cursor);
+  }
+  const folders = folderNames.map((p) => ({
+    prefix: p,
+    size: (stats[p] || {}).size || 0,
+    count: (stats[p] || {}).count || 0,
+    modified: (stats[p] || {}).modified || null,
+  }));
 
   return Response.json({ prefix, folders, files });
 }
@@ -1123,9 +1151,12 @@ function load(prefix, fromHistory) {
       var rows = document.getElementById("rows");
       rows.innerHTML = "";
 
-      data.folders.forEach(function (folder) {
+      data.folders.forEach(function (f) {
+        var folder = f.prefix;
         var name = folder.slice(prefix.length).replace(/\/$/, "");
-        var tr = makeRow(name, "📁", "", "", function () { load(folder); }, [
+        var sizeText = f.count ? humanSize(f.size) : "";
+        var dateText = f.modified ? humanDate(f.modified) : "";
+        var tr = makeRow(name, "📁", sizeText, dateText, function () { load(folder); }, [
           { label: "Delete", onClick: function () { removeFolder(folder); } }
         ]);
         makeDropTarget(tr, folder);
@@ -1617,7 +1648,7 @@ function treeNode(prefix, name, autoExpand) {
       .then(function (data) {
         data.folders.forEach(function (sub) {
           // Children expand themselves too, so the whole tree is always open.
-          children.appendChild(treeNode(sub, sub.slice(prefix.length).replace(/\/$/, ""), true));
+          children.appendChild(treeNode(sub.prefix, sub.prefix.slice(prefix.length).replace(/\/$/, ""), true));
         });
         if (data.folders.length === 0) arrow.style.visibility = "hidden";
       });
@@ -1667,7 +1698,7 @@ function deleteFolderContents(prefix) {
       var deletes = data.files.map(function (f) {
         return fetch("/api/object?key=" + encodeURIComponent(f.key), { method: "DELETE" });
       });
-      var subfolders = data.folders.map(function (sub) { return deleteFolderContents(sub); });
+      var subfolders = data.folders.map(function (sub) { return deleteFolderContents(sub.prefix); });
       return Promise.all(deletes.concat(subfolders));
     })
     .then(function () {
