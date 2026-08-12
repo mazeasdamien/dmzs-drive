@@ -841,6 +841,25 @@ const HTML = String.raw`<!doctype html>
   .sel { width: 26px; }
   .sel input { accent-color: var(--accent); }
   tr.droptarget { outline: 2px solid var(--accent); outline-offset: -2px; }
+  #grid {
+    display: none;
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    gap: 12px;
+  }
+  .tile {
+    position: relative;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+    cursor: pointer;
+  }
+  .tile:hover { border-color: var(--accent); }
+  .tile .thumb { width: 100%; height: 110px; object-fit: cover; display: block; background: var(--hover); }
+  .tile .thumbIcon { height: 110px; display: flex; align-items: center; justify-content: center; font-size: 42px; background: var(--hover); }
+  .tile .tname { font-size: 12px; padding: 6px 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tile .tilecb { position: absolute; top: 6px; left: 6px; display: none; accent-color: var(--accent); }
+  .tile:hover .tilecb, .tile .tilecb:checked { display: block; }
+  .tile.droptarget { outline: 2px solid var(--accent); outline-offset: -2px; }
   @keyframes flashRow {
     from { background: rgba(37, 99, 235, .28); }
     to { background: transparent; }
@@ -914,6 +933,7 @@ const HTML = String.raw`<!doctype html>
   </div>
   <div class="toolbar">
     <input id="searchBox" type="search" placeholder="Search files…" />
+    <button id="viewToggleBtn">Grid view</button>
     <button id="newFolderBtn">New folder</button>
     <button id="uploadBtn" class="primary">Upload</button>
     <button id="trashBtn">Trash</button>
@@ -934,10 +954,11 @@ const HTML = String.raw`<!doctype html>
       <button id="bulkDeleteBtn" class="danger">Delete</button>
       <button id="bulkClearBtn">Clear</button>
     </div>
-    <table>
+    <table id="fileTable">
       <thead><tr><th class="sel"><input type="checkbox" id="selectAll" /></th><th>Name</th><th class="size">Size</th><th class="date" id="dateHeader">Modified</th><th></th></tr></thead>
       <tbody id="rows"></tbody>
     </table>
+    <div id="grid"></div>
     <div id="empty" style="display:none"></div>
   </main>
 </div>
@@ -993,6 +1014,7 @@ function setMode(m) {
   document.getElementById("dropzone").style.display = files ? "" : "none";
   document.getElementById("dateHeader").textContent = trash ? "Deleted" : "Modified";
   document.getElementById("selectAll").style.visibility = trash ? "hidden" : "";
+  document.getElementById("viewToggleBtn").style.display = files ? "" : "none";
   if (m !== "search") document.getElementById("searchBox").value = "";
   clearSelection();
 }
@@ -1024,6 +1046,7 @@ function makeSelTd(key) {
   if (key) {
     var cb = document.createElement("input");
     cb.type = "checkbox";
+    cb.className = "selcb";
     cb.checked = selected.indexOf(key) !== -1;
     cb.onchange = function () { toggleSelect(key, cb.checked); };
     cb.onclick = function (e) { e.stopPropagation(); };
@@ -1140,6 +1163,42 @@ function applyHash() {
   load(prefix, true);
 }
 
+// Per-folder view style: folders named "photos" default to the tile grid;
+// the toggle button stores an override per folder.
+function folderViewStyle(prefix) {
+  var saved = localStorage.getItem("viewstyle:" + prefix);
+  if (saved) return saved;
+  var seg = prefix.replace(/\/$/, "").split("/").pop().toLowerCase();
+  return seg === "photos" ? "grid" : "list";
+}
+
+function showListLayout() {
+  document.getElementById("fileTable").style.display = "";
+  var grid = document.getElementById("grid");
+  grid.style.display = "none";
+  grid.innerHTML = "";
+}
+
+function renameFolder(folder) {
+  var name = folder.replace(/\/$/, "").split("/").pop();
+  var input = prompt("Rename folder to:", name);
+  if (input === null) return;
+  input = input.trim().replace(/\/+$/, "");
+  if (!input || input === name) return;
+  if (input.indexOf("/") !== -1) { alert("The name cannot contain /"); return; }
+  var parent = folder.slice(0, folder.length - name.length - 1);
+  var to = parent + input + "/";
+  fetch("/api/movedir?from=" + encodeURIComponent(folder) + "&to=" + encodeURIComponent(to), { method: "POST" })
+    .then(checkAuth)
+    .then(function (res) {
+      if (!res.ok) return res.text().then(function (t) { alert(t); });
+      return res.json().then(function (r) {
+        if (r.failed) alert(r.failed + " item(s) could not be moved (name conflicts).");
+      });
+    })
+    .then(function () { initTree(); refresh(); });
+}
+
 function load(prefix, fromHistory) {
   currentPrefix = prefix;
   if (!fromHistory) pushPrefixHash(prefix);
@@ -1149,71 +1208,169 @@ function load(prefix, fromHistory) {
     .then(checkAuth)
     .then(function (res) { return res.json(); })
     .then(function (data) {
-      var rows = document.getElementById("rows");
-      rows.innerHTML = "";
-
-      data.folders.forEach(function (f) {
-        var folder = f.prefix;
-        var name = folder.slice(prefix.length).replace(/\/$/, "");
-        var sizeText = f.count ? humanSize(f.size) : "";
-        var dateText = f.modified ? humanDate(f.modified) : "";
-        var tr = makeRow(name, "📁", sizeText, dateText, function () { load(folder); }, [
-          { label: "Delete", onClick: function () { removeFolder(folder); } }
-        ]);
-        makeDropTarget(tr, folder);
-        tr.insertBefore(makeSelTd(null), tr.firstChild);
-        tr.draggable = true;
-        tr.addEventListener("dragstart", function (e) {
-          e.dataTransfer.setData("application/x-drive-dir", folder);
-          e.dataTransfer.effectAllowed = "move";
-        });
-        tr.addEventListener("dragend", function () { lastDragEnd = Date.now(); });
-        rows.appendChild(tr);
-      });
-
       lastFiles = data.files.map(function (f) { return f.key; });
-
-      data.files.forEach(function (file) {
-        var name = file.key.slice(prefix.length);
-        var tr = makeRow(name, "📄", humanSize(file.size), humanDate(file.uploaded),
-          function () { openPreview(file.key); }, [
-            { label: "Share", onClick: function () { shareFile(file.key); } },
-            { label: "Rename", onClick: function () { renameFile(file.key); } },
-            { label: "Download", onClick: function () { download(file.key); } },
-            { label: "Delete", onClick: function () { removeFile(file.key); } }
-          ]);
-        tr.insertBefore(makeSelTd(file.key), tr.firstChild);
-        tr.dataset.key = file.key;
-        tr.draggable = true;
-        tr.addEventListener("dragstart", function (e) {
-          hideHoverPreview();
-          if (selected.length && selected.indexOf(file.key) !== -1) {
-            // Dragging a checked row drags the whole selection.
-            e.dataTransfer.setData("application/x-drive-keys", JSON.stringify(selected));
-          } else {
-            e.dataTransfer.setData("application/x-drive-key", file.key);
-          }
-          e.dataTransfer.effectAllowed = "move";
-        });
-        tr.addEventListener("mouseenter", function (e) {
-          clearTimeout(hoverTimer);
-          hoverTimer = setTimeout(function () { showHoverPreview(file.key, e.clientX, e.clientY); }, 450);
-        });
-        tr.addEventListener("mousemove", function (e) {
-          var hp = document.getElementById("hoverPreview");
-          if (hp.style.display === "block") positionHover(hp, e.clientX, e.clientY);
-        });
-        tr.addEventListener("mouseleave", hideHoverPreview);
-        tr.addEventListener("dragend", function () { lastDragEnd = Date.now(); });
-        rows.appendChild(tr);
-      });
-
+      var style = folderViewStyle(prefix);
+      document.getElementById("viewToggleBtn").textContent = style === "grid" ? "List view" : "Grid view";
+      var table = document.getElementById("fileTable");
+      var grid = document.getElementById("grid");
+      document.getElementById("rows").innerHTML = "";
+      grid.innerHTML = "";
+      if (style === "grid") {
+        table.style.display = "none";
+        grid.style.display = "grid";
+        renderGrid(data, prefix);
+      } else {
+        table.style.display = "";
+        grid.style.display = "none";
+        renderListRows(data, prefix);
+      }
       showEmpty(data.folders.length + data.files.length, "This folder is empty.");
       updateTreeActive();
     });
 }
 
+function renderListRows(data, prefix) {
+  var rows = document.getElementById("rows");
+
+  data.folders.forEach(function (f) {
+    var folder = f.prefix;
+    var name = folder.slice(prefix.length).replace(/\/$/, "");
+    var sizeText = f.count ? humanSize(f.size) : "";
+    var dateText = f.modified ? humanDate(f.modified) : "";
+    var tr = makeRow(name, "📁", sizeText, dateText, function () { load(folder); }, [
+      { label: "Rename", onClick: function () { renameFolder(folder); } },
+      { label: "Delete", onClick: function () { removeFolder(folder); } }
+    ]);
+    makeDropTarget(tr, folder);
+    tr.insertBefore(makeSelTd(null), tr.firstChild);
+    tr.draggable = true;
+    tr.addEventListener("dragstart", function (e) {
+      e.dataTransfer.setData("application/x-drive-dir", folder);
+      e.dataTransfer.effectAllowed = "move";
+    });
+    tr.addEventListener("dragend", function () { lastDragEnd = Date.now(); });
+    rows.appendChild(tr);
+  });
+
+  data.files.forEach(function (file) {
+    var name = file.key.slice(prefix.length);
+    var tr = makeRow(name, "📄", humanSize(file.size), humanDate(file.uploaded),
+      function () { openPreview(file.key); }, [
+        { label: "Share", onClick: function () { shareFile(file.key); } },
+        { label: "Rename", onClick: function () { renameFile(file.key); } },
+        { label: "Download", onClick: function () { download(file.key); } },
+        { label: "Delete", onClick: function () { removeFile(file.key); } }
+      ]);
+    tr.insertBefore(makeSelTd(file.key), tr.firstChild);
+    tr.dataset.key = file.key;
+    tr.draggable = true;
+    tr.addEventListener("dragstart", function (e) {
+      hideHoverPreview();
+      if (selected.length && selected.indexOf(file.key) !== -1) {
+        // Dragging a checked row drags the whole selection.
+        e.dataTransfer.setData("application/x-drive-keys", JSON.stringify(selected));
+      } else {
+        e.dataTransfer.setData("application/x-drive-key", file.key);
+      }
+      e.dataTransfer.effectAllowed = "move";
+    });
+    tr.addEventListener("mouseenter", function (e) {
+      clearTimeout(hoverTimer);
+      hoverTimer = setTimeout(function () { showHoverPreview(file.key, e.clientX, e.clientY); }, 450);
+    });
+    tr.addEventListener("mousemove", function (e) {
+      var hp = document.getElementById("hoverPreview");
+      if (hp.style.display === "block") positionHover(hp, e.clientX, e.clientY);
+    });
+    tr.addEventListener("mouseleave", hideHoverPreview);
+    tr.addEventListener("dragend", function () { lastDragEnd = Date.now(); });
+    rows.appendChild(tr);
+  });
+}
+
+function renderGrid(data, prefix) {
+  var grid = document.getElementById("grid");
+  var imgExts = ["png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "ico"];
+
+  data.folders.forEach(function (f) {
+    var folder = f.prefix;
+    var name = folder.slice(prefix.length).replace(/\/$/, "");
+    var tile = document.createElement("div");
+    tile.className = "tile";
+    var icon = document.createElement("div");
+    icon.className = "thumbIcon";
+    icon.textContent = "📁";
+    tile.appendChild(icon);
+    var nm = document.createElement("div");
+    nm.className = "tname";
+    nm.textContent = name;
+    nm.title = name;
+    tile.appendChild(nm);
+    tile.onclick = function () {
+      if (Date.now() - lastDragEnd < 400) return;
+      load(folder);
+    };
+    makeDropTarget(tile, folder);
+    tile.draggable = true;
+    tile.addEventListener("dragstart", function (e) {
+      e.dataTransfer.setData("application/x-drive-dir", folder);
+      e.dataTransfer.effectAllowed = "move";
+    });
+    tile.addEventListener("dragend", function () { lastDragEnd = Date.now(); });
+    grid.appendChild(tile);
+  });
+
+  data.files.forEach(function (file) {
+    var name = file.key.slice(prefix.length);
+    var tile = document.createElement("div");
+    tile.className = "tile";
+    if (imgExts.indexOf(extOf(file.key)) !== -1) {
+      var im = document.createElement("img");
+      im.className = "thumb";
+      im.loading = "lazy";
+      im.src = "/api/object?key=" + encodeURIComponent(file.key) + "&view=1";
+      tile.appendChild(im);
+    } else {
+      var icon = document.createElement("div");
+      icon.className = "thumbIcon";
+      icon.textContent = "📄";
+      tile.appendChild(icon);
+    }
+    var nm = document.createElement("div");
+    nm.className = "tname";
+    nm.textContent = name;
+    nm.title = name;
+    tile.appendChild(nm);
+
+    var cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.className = "selcb tilecb";
+    cb.checked = selected.indexOf(file.key) !== -1;
+    cb.onchange = function () { toggleSelect(file.key, cb.checked); };
+    cb.onclick = function (e) { e.stopPropagation(); };
+    tile.appendChild(cb);
+
+    tile.onclick = function () {
+      if (Date.now() - lastDragEnd < 400) return;
+      openPreview(file.key);
+    };
+    tile.draggable = true;
+    tile.addEventListener("dragstart", function (e) {
+      hideHoverPreview();
+      if (selected.length && selected.indexOf(file.key) !== -1) {
+        e.dataTransfer.setData("application/x-drive-keys", JSON.stringify(selected));
+      } else {
+        e.dataTransfer.setData("application/x-drive-key", file.key);
+      }
+      e.dataTransfer.effectAllowed = "move";
+    });
+    tile.addEventListener("dragend", function () { lastDragEnd = Date.now(); });
+    grid.appendChild(tile);
+  });
+}
+
 function loadTrash() {
+  showListLayout();
   renderBreadcrumb();
   return fetch("/api/trash/list")
     .then(checkAuth)
@@ -1504,6 +1661,7 @@ function moveFile(key, destPrefix) {
 
 function loadSearch() {
   clearSelection();
+  showListLayout();
   renderBreadcrumb();
   return fetch("/api/search?q=" + encodeURIComponent(searchQuery))
     .then(checkAuth)
@@ -1826,14 +1984,20 @@ document.getElementById("searchBox").oninput = function () {
 document.getElementById("selectAll").onchange = function () {
   var on = this.checked;
   lastFiles.forEach(function (k) { toggleSelect(k, on); });
-  var cbs = document.querySelectorAll("#rows .sel input");
+  var cbs = document.querySelectorAll(".selcb");
   Array.prototype.forEach.call(cbs, function (c) { c.checked = on; });
 };
 
 document.getElementById("bulkClearBtn").onclick = function () {
   clearSelection();
-  var cbs = document.querySelectorAll("#rows .sel input");
+  var cbs = document.querySelectorAll(".selcb");
   Array.prototype.forEach.call(cbs, function (c) { c.checked = false; });
+};
+
+document.getElementById("viewToggleBtn").onclick = function () {
+  var next = folderViewStyle(currentPrefix) === "grid" ? "list" : "grid";
+  localStorage.setItem("viewstyle:" + currentPrefix, next);
+  load(currentPrefix, true);
 };
 
 document.getElementById("bulkDeleteBtn").onclick = function () {
