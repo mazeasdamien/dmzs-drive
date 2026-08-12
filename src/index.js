@@ -848,6 +848,21 @@ const HTML = String.raw`<!doctype html>
   #previewBody img { max-width: 95%; max-height: 95%; object-fit: contain; }
   #previewBody video { max-width: 95%; max-height: 95%; }
   .noPreview { color: #eee; text-align: center; padding: 24px; }
+  #hoverPreview {
+    position: fixed;
+    z-index: 20;
+    width: 320px;
+    height: 380px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    box-shadow: 0 8px 30px rgba(0, 0, 0, .3);
+    overflow: hidden;
+    pointer-events: none;
+    display: none;
+  }
+  #hoverPreview iframe { width: 100%; height: 100%; border: none; background: white; }
+  #hoverPreview img { width: 100%; height: 100%; object-fit: contain; }
   @media (max-width: 700px) {
     #sidebar { display: none; }
   }
@@ -897,6 +912,7 @@ const HTML = String.raw`<!doctype html>
     <div id="empty" style="display:none"></div>
   </main>
 </div>
+<div id="hoverPreview"></div>
 <div id="previewOverlay" style="display:none">
   <div id="previewHeader">
     <span id="previewTitle"></span>
@@ -1127,6 +1143,7 @@ function load(prefix, fromHistory) {
         tr.dataset.key = file.key;
         tr.draggable = true;
         tr.addEventListener("dragstart", function (e) {
+          hideHoverPreview();
           if (selected.length && selected.indexOf(file.key) !== -1) {
             // Dragging a checked row drags the whole selection.
             e.dataTransfer.setData("application/x-drive-keys", JSON.stringify(selected));
@@ -1135,6 +1152,15 @@ function load(prefix, fromHistory) {
           }
           e.dataTransfer.effectAllowed = "move";
         });
+        tr.addEventListener("mouseenter", function (e) {
+          clearTimeout(hoverTimer);
+          hoverTimer = setTimeout(function () { showHoverPreview(file.key, e.clientX, e.clientY); }, 450);
+        });
+        tr.addEventListener("mousemove", function (e) {
+          var hp = document.getElementById("hoverPreview");
+          if (hp.style.display === "block") positionHover(hp, e.clientX, e.clientY);
+        });
+        tr.addEventListener("mouseleave", hideHoverPreview);
         tr.addEventListener("dragend", function () { lastDragEnd = Date.now(); });
         rows.appendChild(tr);
       });
@@ -1191,6 +1217,51 @@ function download(key) {
   window.location = "/api/object?key=" + encodeURIComponent(key);
 }
 
+// ---- Hover preview (small popup following the cursor) ----
+
+var hoverTimer = null;
+
+function positionHover(el, x, y) {
+  var w = 320, h = 380, m = 12;
+  var left = x + 18, top = y + 18;
+  if (left + w + m > window.innerWidth) left = x - w - 18;
+  if (top + h + m > window.innerHeight) top = Math.max(m, window.innerHeight - h - m);
+  if (left < m) left = m;
+  el.style.left = left + "px";
+  el.style.top = top + "px";
+}
+
+function showHoverPreview(key, x, y) {
+  var ext = extOf(key);
+  var url = "/api/object?key=" + encodeURIComponent(key) + "&view=1";
+  var imgs = ["png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "ico"];
+  var texts = ["txt", "md", "csv", "json", "js", "css", "log", "yml", "yaml", "ini", "py", "sh"];
+  var node = null;
+  if (imgs.indexOf(ext) !== -1) {
+    node = document.createElement("img");
+    node.src = url;
+  } else if (ext === "pdf") {
+    node = document.createElement("iframe");
+    node.src = url + "#toolbar=0&navpanes=0&scrollbar=0&view=FitH";
+  } else if (texts.indexOf(ext) !== -1) {
+    node = document.createElement("iframe");
+    node.src = url;
+  }
+  if (!node) return; // other types: no hover preview, click opens the full one
+  var el = document.getElementById("hoverPreview");
+  el.innerHTML = "";
+  el.appendChild(node);
+  positionHover(el, x, y);
+  el.style.display = "block";
+}
+
+function hideHoverPreview() {
+  clearTimeout(hoverTimer);
+  var el = document.getElementById("hoverPreview");
+  el.style.display = "none";
+  el.innerHTML = "";
+}
+
 // ---- In-page preview ----
 
 function extOf(key) {
@@ -1206,6 +1277,7 @@ function closePreview() {
 }
 
 function openPreview(key) {
+  hideHoverPreview();
   previewKey = key;
   document.getElementById("previewTitle").textContent = key.split("/").pop();
   var body = document.getElementById("previewBody");
@@ -1389,6 +1461,7 @@ function loadSearch() {
         tr.dataset.key = file.key;
         tr.draggable = true;
         tr.addEventListener("dragstart", function (e) {
+          hideHoverPreview();
           if (selected.length && selected.indexOf(file.key) !== -1) {
             // Dragging a checked row drags the whole selection.
             e.dataTransfer.setData("application/x-drive-keys", JSON.stringify(selected));
@@ -1397,6 +1470,15 @@ function loadSearch() {
           }
           e.dataTransfer.effectAllowed = "move";
         });
+        tr.addEventListener("mouseenter", function (e) {
+          clearTimeout(hoverTimer);
+          hoverTimer = setTimeout(function () { showHoverPreview(file.key, e.clientX, e.clientY); }, 450);
+        });
+        tr.addEventListener("mousemove", function (e) {
+          var hp = document.getElementById("hoverPreview");
+          if (hp.style.display === "block") positionHover(hp, e.clientX, e.clientY);
+        });
+        tr.addEventListener("mouseleave", hideHoverPreview);
         tr.addEventListener("dragend", function () { lastDragEnd = Date.now(); });
         rows.appendChild(tr);
       });
