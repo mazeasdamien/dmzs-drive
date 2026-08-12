@@ -936,11 +936,14 @@ const HTML = String.raw`<!doctype html>
     <button id="viewToggleBtn">Grid view</button>
     <button id="newFolderBtn">New folder</button>
     <button id="uploadBtn" class="primary">Upload</button>
+    <button id="backupBtn">Backup</button>
     <button id="trashBtn">Trash</button>
     <button id="backBtn" style="display:none">&larr; Back to files</button>
     <button id="emptyTrashBtn" class="danger" style="display:none">Empty trash</button>
     <button id="logoutBtn">Log out</button>
+    <button id="uploadFolderBtn">Upload folder</button>
     <input id="fileInput" type="file" multiple style="display:none" />
+    <input id="folderInput" type="file" webkitdirectory multiple style="display:none" />
   </div>
 </header>
 <div id="layout">
@@ -1008,6 +1011,7 @@ function setMode(m) {
   var trash = m === "trash";
   document.getElementById("newFolderBtn").style.display = files ? "" : "none";
   document.getElementById("uploadBtn").style.display = files ? "" : "none";
+  document.getElementById("uploadFolderBtn").style.display = files ? "" : "none";
   document.getElementById("trashBtn").style.display = trash ? "none" : "";
   document.getElementById("backBtn").style.display = trash ? "" : "none";
   document.getElementById("emptyTrashBtn").style.display = trash ? "" : "none";
@@ -1015,6 +1019,7 @@ function setMode(m) {
   document.getElementById("dateHeader").textContent = trash ? "Deleted" : "Modified";
   document.getElementById("selectAll").style.visibility = trash ? "hidden" : "";
   document.getElementById("viewToggleBtn").style.display = files ? "" : "none";
+  document.getElementById("backupBtn").style.display = files ? "" : "none";
   if (m !== "search") document.getElementById("searchBox").value = "";
   clearSelection();
 }
@@ -1742,6 +1747,130 @@ function refreshUsage() {
     });
 }
 
+// ---- Full-drive backup (ZIP built client-side, stored uncompressed) ----
+
+var crcTable = null;
+function crc32(data) {
+  if (!crcTable) {
+    crcTable = new Uint32Array(256);
+    for (var n = 0; n < 256; n++) {
+      var c = n;
+      for (var k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+      crcTable[n] = c >>> 0;
+    }
+  }
+  var crc = 0xffffffff;
+  for (var i = 0; i < data.length; i++) crc = crcTable[(crc ^ data[i]) & 0xff] ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function dosDateTime(d) {
+  if (isNaN(d.getTime())) d = new Date();
+  var year = Math.max(1980, d.getFullYear());
+  return {
+    time: (d.getHours() << 11) | (d.getMinutes() << 5) | Math.floor(d.getSeconds() / 2),
+    date: ((year - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate()
+  };
+}
+
+function listAllFiles(prefix) {
+  return fetch("/api/list?prefix=" + encodeURIComponent(prefix))
+    .then(checkAuth)
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      var subs = data.folders.map(function (f) { return listAllFiles(f.prefix); });
+      return Promise.all(subs).then(function (nested) {
+        var all = data.files.slice();
+        nested.forEach(function (n) { all = all.concat(n); });
+        return all;
+      });
+    });
+}
+
+function backupDrive() {
+  var progress = document.getElementById("progress");
+  progress.textContent = "Preparing backup…";
+  listAllFiles("").then(function (files) {
+    if (!files.length) { progress.textContent = ""; alert("Nothing to back up."); return; }
+    var enc = new TextEncoder();
+    var parts = [];
+    var central = [];
+    var offset = 0;
+    var i = 0;
+
+    function next() {
+      if (i >= files.length) { finish(); return; }
+      var f = files[i];
+      progress.textContent = "Backing up " + (i + 1) + "/" + files.length + ": " + f.key;
+      fetch("/api/object?key=" + encodeURIComponent(f.key))
+        .then(checkAuth)
+        .then(function (r) { return r.arrayBuffer(); })
+        .then(function (buf) {
+          var data = new Uint8Array(buf);
+          var nameBytes = enc.encode(f.key);
+          var crc = crc32(data);
+          var dt = dosDateTime(new Date(f.uploaded));
+          var lh = new DataView(new ArrayBuffer(30));
+          lh.setUint32(0, 0x04034b50, true);
+          lh.setUint16(4, 20, true);
+          lh.setUint16(6, 0x0800, true); // UTF-8 file names
+          lh.setUint16(8, 0, true);      // stored, no compression
+          lh.setUint16(10, dt.time, true);
+          lh.setUint16(12, dt.date, true);
+          lh.setUint32(14, crc, true);
+          lh.setUint32(18, data.length, true);
+          lh.setUint32(22, data.length, true);
+          lh.setUint16(26, nameBytes.length, true);
+          lh.setUint16(28, 0, true);
+          parts.push(new Uint8Array(lh.buffer), nameBytes, data);
+          central.push({ name: nameBytes, crc: crc, size: data.length, time: dt.time, date: dt.date, offset: offset });
+          offset += 30 + nameBytes.length + data.length;
+          i++;
+          next();
+        });
+    }
+
+    function finish() {
+      var cdStart = offset;
+      central.forEach(function (c) {
+        var ch = new DataView(new ArrayBuffer(46));
+        ch.setUint32(0, 0x02014b50, true);
+        ch.setUint16(4, 20, true);
+        ch.setUint16(6, 20, true);
+        ch.setUint16(8, 0x0800, true);
+        ch.setUint16(10, 0, true);
+        ch.setUint16(12, c.time, true);
+        ch.setUint16(14, c.date, true);
+        ch.setUint32(16, c.crc, true);
+        ch.setUint32(20, c.size, true);
+        ch.setUint32(24, c.size, true);
+        ch.setUint16(28, c.name.length, true);
+        ch.setUint32(42, c.offset, true);
+        parts.push(new Uint8Array(ch.buffer), c.name);
+        offset += 46 + c.name.length;
+      });
+      var eocd = new DataView(new ArrayBuffer(22));
+      eocd.setUint32(0, 0x06054b50, true);
+      eocd.setUint16(8, central.length, true);
+      eocd.setUint16(10, central.length, true);
+      eocd.setUint32(12, offset - cdStart, true);
+      eocd.setUint32(16, cdStart, true);
+      parts.push(new Uint8Array(eocd.buffer));
+
+      var blob = new Blob(parts, { type: "application/zip" });
+      var a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "drive-backup-" + new Date().toISOString().slice(0, 10) + ".zip";
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 10000);
+      progress.textContent = "";
+    }
+
+    next();
+  });
+}
+
 function dragKind(e) {
   var t = e.dataTransfer.types;
   if (Array.prototype.indexOf.call(t, "application/x-drive-keys") !== -1) return "files";
@@ -1898,31 +2027,70 @@ function purgeFile(key) {
     .then(checkAuth).then(function () { refreshUsage(); refresh(); });
 }
 
-function uploadFiles(fileList) {
-  var files = Array.prototype.slice.call(fileList);
+function uploadItems(items) {
   var progress = document.getElementById("progress");
   var i = 0;
   function next() {
-    if (i >= files.length) {
+    if (i >= items.length) {
       progress.textContent = "";
       refreshUsage();
+      initTree();
       refresh();
       return;
     }
-    var file = files[i];
-    progress.textContent = "Uploading " + (i + 1) + "/" + files.length + ": " + file.name;
-    var key = currentPrefix + file.name;
-    fetch("/api/object?key=" + encodeURIComponent(key), {
+    var it = items[i];
+    progress.textContent = "Uploading " + (i + 1) + "/" + items.length + ": " + it.relPath;
+    fetch("/api/object?key=" + encodeURIComponent(currentPrefix + it.relPath), {
       method: "PUT",
-      headers: { "content-type": file.type || "application/octet-stream" },
-      body: file,
+      headers: { "content-type": it.file.type || "application/octet-stream" },
+      body: it.file,
     }).then(checkAuth).then(function () { i++; next(); });
   }
   next();
 }
 
+function uploadFiles(fileList) {
+  // webkitRelativePath is set when a whole folder was picked: keep its structure.
+  var items = Array.prototype.map.call(fileList, function (f) {
+    return { file: f, relPath: f.webkitRelativePath || f.name };
+  });
+  uploadItems(items);
+}
+
+// Walks a dropped directory tree (webkitGetAsEntry API) into {file, relPath} items.
+function traverseEntry(entry, path) {
+  return new Promise(function (resolve) {
+    if (entry.isFile) {
+      entry.file(
+        function (f) { resolve([{ file: f, relPath: path + f.name }]); },
+        function () { resolve([]); }
+      );
+    } else if (entry.isDirectory) {
+      var reader = entry.createReader();
+      var pending = [];
+      function readBatch() {
+        reader.readEntries(function (entries) {
+          if (!entries.length) {
+            Promise.all(pending).then(function (nested) {
+              resolve(nested.reduce(function (a, b) { return a.concat(b); }, []));
+            });
+            return;
+          }
+          entries.forEach(function (en) { pending.push(traverseEntry(en, path + entry.name + "/")); });
+          readBatch(); // readEntries returns at most ~100 entries per call
+        }, function () { resolve([]); });
+      }
+      readBatch();
+    } else {
+      resolve([]);
+    }
+  });
+}
+
 document.getElementById("uploadBtn").onclick = function () { document.getElementById("fileInput").click(); };
-document.getElementById("fileInput").onchange = function (e) { uploadFiles(e.target.files); };
+document.getElementById("fileInput").onchange = function (e) { uploadFiles(e.target.files); e.target.value = ""; };
+document.getElementById("uploadFolderBtn").onclick = function () { document.getElementById("folderInput").click(); };
+document.getElementById("folderInput").onchange = function (e) { uploadFiles(e.target.files); e.target.value = ""; };
 
 document.getElementById("newFolderBtn").onclick = function () {
   var name = prompt("Folder name:");
@@ -1956,7 +2124,22 @@ var dropzone = document.getElementById("dropzone");
   dropzone.addEventListener(evt, function (e) { e.preventDefault(); dropzone.classList.remove("drag"); });
 });
 dropzone.addEventListener("drop", function (e) {
-  if (e.dataTransfer.files.length) uploadFiles(e.dataTransfer.files);
+  var entries = [];
+  if (e.dataTransfer.items) {
+    for (var j = 0; j < e.dataTransfer.items.length; j++) {
+      var en = e.dataTransfer.items[j].webkitGetAsEntry && e.dataTransfer.items[j].webkitGetAsEntry();
+      if (en) entries.push(en);
+    }
+  }
+  if (entries.length) {
+    // Handles dropped folders (recursively) as well as plain files.
+    Promise.all(entries.map(function (en) { return traverseEntry(en, ""); }))
+      .then(function (nested) {
+        uploadItems(nested.reduce(function (a, b) { return a.concat(b); }, []));
+      });
+  } else if (e.dataTransfer.files.length) {
+    uploadFiles(e.dataTransfer.files);
+  }
 });
 
 document.getElementById("previewCloseBtn").onclick = closePreview;
@@ -1992,6 +2175,16 @@ document.getElementById("bulkClearBtn").onclick = function () {
   clearSelection();
   var cbs = document.querySelectorAll(".selcb");
   Array.prototype.forEach.call(cbs, function (c) { c.checked = false; });
+};
+
+document.getElementById("backupBtn").onclick = function () {
+  fetch("/api/usage")
+    .then(checkAuth)
+    .then(function (r) { return r.json(); })
+    .then(function (u) {
+      if (!confirm("Download a full backup of the drive as a ZIP (" + humanSize(u.driveBytes) + ", " + u.driveCount + " files)?")) return;
+      backupDrive();
+    });
 };
 
 document.getElementById("viewToggleBtn").onclick = function () {
