@@ -855,6 +855,7 @@ const HTML = String.raw`<!doctype html>
     display: flex;
     flex-direction: column;
   }
+  #previewOverlay:focus { outline: none; }
   #previewHeader {
     display: flex;
     align-items: center;
@@ -941,7 +942,7 @@ const HTML = String.raw`<!doctype html>
   </main>
 </div>
 <div id="hoverPreview"></div>
-<div id="previewOverlay" style="display:none">
+<div id="previewOverlay" style="display:none" tabindex="-1">
   <div id="previewHeader">
     <span id="previewTitle"></span>
     <div class="toolbar">
@@ -1318,6 +1319,23 @@ function closePreview() {
   document.getElementById("previewBody").innerHTML = ""; // also stops any playing media
 }
 
+// Chrome's PDF viewer grabs keyboard focus when it loads, which would swallow
+// the Escape key. Take focus back, and also listen for Escape inside
+// same-origin preview frames as a best effort.
+function escFrame(frame) {
+  frame.addEventListener("load", function () {
+    setTimeout(function () {
+      var ov = document.getElementById("previewOverlay");
+      if (ov.style.display !== "none") ov.focus();
+    }, 50);
+    try {
+      frame.contentWindow.addEventListener("keydown", function (e) {
+        if (e.key === "Escape") closePreview();
+      });
+    } catch (err) { /* cross-origin frame (Office viewer): ignore */ }
+  });
+}
+
 function openPreview(key) {
   hideHoverPreview();
   previewKey = key;
@@ -1325,6 +1343,8 @@ function openPreview(key) {
   var body = document.getElementById("previewBody");
   body.innerHTML = "";
   document.getElementById("previewOverlay").style.display = "flex";
+
+  document.getElementById("previewOverlay").focus();
 
   var inlineUrl = "/api/object?key=" + encodeURIComponent(key) + "&view=1";
   var ext = extOf(key);
@@ -1341,6 +1361,7 @@ function openPreview(key) {
   } else if (ext === "pdf" || texts.indexOf(ext) !== -1) {
     var frame = document.createElement("iframe");
     frame.src = inlineUrl;
+    escFrame(frame);
     body.appendChild(frame);
   } else if (audios.indexOf(ext) !== -1) {
     var au = document.createElement("audio");
@@ -1367,6 +1388,7 @@ function openPreview(key) {
         body.innerHTML = "";
         var frame = document.createElement("iframe");
         frame.src = "https://view.officeapps.live.com/op/embed.aspx?src=" + encodeURIComponent(data.url);
+        escFrame(frame);
         body.appendChild(frame);
       });
   } else {
@@ -1390,6 +1412,7 @@ function openPreview(key) {
         } else if (ct === "application/pdf" || ct.indexOf("text/") === 0) {
           var frame2 = document.createElement("iframe");
           frame2.src = inlineUrl;
+          escFrame(frame2);
           body.appendChild(frame2);
         } else if (ct.indexOf("audio/") === 0) {
           var au2 = document.createElement("audio");
