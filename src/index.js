@@ -1046,7 +1046,8 @@ const HTML = String.raw`<!doctype html>
     <input id="searchBox" type="search" placeholder="Search files…" />
     <button id="viewToggleBtn">Grid view</button>
     <button id="newFolderBtn">New folder</button>
-    <button id="uploadBtn" class="primary">Upload</button>
+    <button id="uploadBtn" class="primary">Upload files</button>
+    <button id="uploadFolderBtn">Upload folder</button>
     <button id="backupBtn">Backup</button>
     <button id="sharesBtn">Shares</button>
     <button id="trashBtn">Trash</button>
@@ -1055,7 +1056,6 @@ const HTML = String.raw`<!doctype html>
     <button id="emptyTrashBtn" class="danger" style="display:none">Empty trash</button>
     <button id="revokeAllBtn" class="danger" style="display:none">Revoke all</button>
     <button id="logoutBtn">Log out</button>
-    <button id="uploadFolderBtn">Upload folder</button>
     <input id="fileInput" type="file" multiple style="display:none" />
     <input id="folderInput" type="file" webkitdirectory multiple style="display:none" />
   </div>
