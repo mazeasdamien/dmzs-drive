@@ -1503,14 +1503,10 @@ function treeNode(prefix, name, autoExpand) {
       .then(function (res) { return res.json(); })
       .then(function (data) {
         data.folders.forEach(function (sub) {
-          children.appendChild(treeNode(sub, sub.slice(prefix.length).replace(/\/$/, "")));
+          // Children expand themselves too, so the whole tree is always open.
+          children.appendChild(treeNode(sub, sub.slice(prefix.length).replace(/\/$/, ""), true));
         });
-        if (data.folders.length === 0) {
-          var none = document.createElement("div");
-          none.className = "treeEmpty";
-          none.textContent = "no subfolders";
-          children.appendChild(none);
-        }
+        if (data.folders.length === 0) arrow.style.visibility = "hidden";
       });
   };
 
