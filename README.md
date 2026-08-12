@@ -2,8 +2,10 @@
 
 A tiny personal file drive: a Cloudflare Worker + single-page UI backed by the
 `dmzs-drive` R2 bucket (already created in your Cloudflare account). Upload,
-browse with a folder tree, preview, rename, move (drag & drop), download, and
-delete — all from a browser, no app required.
+browse with a folder tree, search, preview, rename, move (drag & drop or
+multi-select), share via expiring links, download, and delete — all from a
+browser. Installable as an app (PWA) on mobile, with storage usage shown in
+the sidebar.
 
 Previews open in-page: PDFs, images, text, audio and video render directly in
 the browser. Word/Excel/PowerPoint files render through Microsoft's embedded

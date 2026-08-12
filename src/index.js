@@ -23,9 +23,24 @@
 // A daily cron (see wrangler.jsonc "triggers") purges trash entries older
 // than TRASH_RETENTION_DAYS.
 
+import { ICON_192, ICON_512, APPLE_ICON } from "./icons.js";
+
 const TRASH = ".trash/";
 const SESSION_DAYS = 30;
 const TRASH_RETENTION_DAYS = 30;
+
+const MANIFEST = {
+  name: "Damien's Drive",
+  short_name: "Drive",
+  start_url: "/",
+  display: "standalone",
+  background_color: "#14161a",
+  theme_color: "#2563eb",
+  icons: [
+    { src: "/icon-192.png", sizes: "192x192", type: "image/png" },
+    { src: "/icon-512.png", sizes: "512x512", type: "image/png" },
+  ],
+};
 
 export default {
   async fetch(request, env) {
@@ -33,6 +48,17 @@ export default {
 
     if (url.pathname === "/api/login" && request.method === "POST") {
       return handleLogin(request, env);
+    }
+
+    // PWA assets are public: they contain nothing sensitive and the browser
+    // fetches the manifest without credentials.
+    if (request.method === "GET") {
+      if (url.pathname === "/manifest.json") {
+        return Response.json(MANIFEST, { headers: { "cache-control": "public, max-age=3600" } });
+      }
+      if (url.pathname === "/icon-192.png") return pngResponse(ICON_192);
+      if (url.pathname === "/icon-512.png") return pngResponse(ICON_512);
+      if (url.pathname === "/apple-touch-icon.png") return pngResponse(APPLE_ICON);
     }
 
     // Time-limited signed links: lets the Office preview's external viewer
@@ -70,6 +96,12 @@ export default {
       if (url.pathname === "/api/rename" && request.method === "POST") {
         return await handleRename(url, env);
       }
+      if (url.pathname === "/api/search" && request.method === "GET") {
+        return await handleSearch(url, env);
+      }
+      if (url.pathname === "/api/usage" && request.method === "GET") {
+        return await handleUsage(env);
+      }
       if (url.pathname === "/api/trash/list" && request.method === "GET") {
         return await handleTrashList(env);
       }
@@ -104,6 +136,13 @@ export default {
 
 function htmlResponse(body) {
   return new Response(body, { headers: { "content-type": "text/html;charset=UTF-8" } });
+}
+
+function pngResponse(b64) {
+  const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+  return new Response(bytes, {
+    headers: { "content-type": "image/png", "cache-control": "public, max-age=86400" },
+  });
 }
 
 // ---------- Auth ----------
@@ -185,7 +224,10 @@ const SIGNED_URL_TTL_SECONDS = 300;
 async function handleSign(url, env) {
   const key = url.searchParams.get("key");
   if (!key) return new Response("Missing key", { status: 400 });
-  const exp = Math.floor(Date.now() / 1000) + SIGNED_URL_TTL_SECONDS;
+  // Default 5 min (previews); share links may ask for up to 7 days.
+  const requested = parseInt(url.searchParams.get("ttl") || "", 10);
+  const ttl = Math.min(Math.max(requested || SIGNED_URL_TTL_SECONDS, 60), 7 * 86400);
+  const exp = Math.floor(Date.now() / 1000) + ttl;
   const sig = await hmacHex(sessionKey(env), "url|" + key + "|" + exp);
   return Response.json({
     url:
@@ -335,6 +377,41 @@ async function handleMkdir(url, env) {
   return new Response("OK");
 }
 
+// ---------- Search & usage ----------
+
+async function handleSearch(url, env) {
+  const q = (url.searchParams.get("q") || "").toLowerCase();
+  if (!q) return Response.json({ files: [] });
+  const files = [];
+  let cursor;
+  do {
+    const page = await env.DRIVE_BUCKET.list({ cursor });
+    for (const o of page.objects) {
+      if (o.key.startsWith(TRASH) || o.key.endsWith("/")) continue;
+      if (o.key.toLowerCase().includes(q)) {
+        files.push({ key: o.key, size: o.size, uploaded: o.uploaded });
+      }
+    }
+    cursor = page.truncated && files.length < 300 ? page.cursor : undefined;
+  } while (cursor);
+  files.sort((a, b) => a.key.localeCompare(b.key));
+  return Response.json({ files: files.slice(0, 300) });
+}
+
+async function handleUsage(env) {
+  let driveBytes = 0, driveCount = 0, trashBytes = 0;
+  let cursor;
+  do {
+    const page = await env.DRIVE_BUCKET.list({ cursor });
+    for (const o of page.objects) {
+      if (o.key.startsWith(TRASH)) trashBytes += o.size;
+      else if (!o.key.endsWith("/")) { driveBytes += o.size; driveCount++; }
+    }
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+  return Response.json({ driveBytes, driveCount, trashBytes });
+}
+
 // ---------- Trash ----------
 
 async function handleTrashList(env) {
@@ -414,6 +491,10 @@ const LOGIN_HTML = String.raw`<!doctype html>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Damien's Drive — sign in</title>
+<link rel="manifest" href="/manifest.json" />
+<link rel="icon" href="/icon-192.png" type="image/png" />
+<link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+<meta name="theme-color" content="#2563eb" />
 <style>
   :root {
     color-scheme: light dark;
@@ -530,6 +611,10 @@ const HTML = String.raw`<!doctype html>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Damien's Drive</title>
+<link rel="manifest" href="/manifest.json" />
+<link rel="icon" href="/icon-192.png" type="image/png" />
+<link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+<meta name="theme-color" content="#2563eb" />
 <style>
   :root {
     color-scheme: light dark;
@@ -614,6 +699,20 @@ const HTML = String.raw`<!doctype html>
     border-right: 1px solid var(--border);
     padding: 12px 8px;
     overflow-y: auto;
+    position: sticky;
+    top: 0;
+    align-self: flex-start;
+    max-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  #tree { flex: 1; }
+  #usage {
+    color: var(--muted);
+    font-size: 12px;
+    padding: 10px 6px 2px;
+    border-top: 1px solid var(--border);
+    margin-top: 10px;
   }
   .treeRow {
     display: flex;
@@ -632,6 +731,27 @@ const HTML = String.raw`<!doctype html>
   .treeRow .arrow { width: 14px; flex-shrink: 0; text-align: center; color: var(--muted); }
   .treeChildren { margin-left: 14px; }
   .treeEmpty { color: var(--muted); font-size: 12px; padding: 2px 8px 2px 24px; }
+  #searchBox {
+    font: inherit;
+    font-size: 13.5px;
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--fg);
+    width: 170px;
+  }
+  #searchBox:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  #selectionBar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    margin-bottom: 12px;
+  }
+  #selectionBar button { padding: 3px 10px; font-size: 12px; }
+  .sel { width: 26px; }
+  .sel input { accent-color: var(--accent); }
   tr.droptarget { outline: 2px solid var(--accent); outline-offset: -2px; }
   #breadcrumb span.droptarget, .treeRow.droptarget { color: var(--accent); background: var(--hover); }
   #previewOverlay {
@@ -670,6 +790,10 @@ const HTML = String.raw`<!doctype html>
     header { padding: 12px 16px; }
     main { padding: 16px; }
     .date { display: none; }
+    th, td { padding: 6px 4px; }
+    .actions button { padding: 3px 6px; font-size: 11px; margin-left: 2px; }
+    #searchBox { width: 120px; }
+    .toolbar { gap: 6px; }
   }
 </style>
 </head>
@@ -680,6 +804,7 @@ const HTML = String.raw`<!doctype html>
     <div id="breadcrumb"></div>
   </div>
   <div class="toolbar">
+    <input id="searchBox" type="search" placeholder="Search files…" />
     <button id="newFolderBtn">New folder</button>
     <button id="uploadBtn" class="primary">Upload</button>
     <button id="trashBtn">Trash</button>
@@ -690,12 +815,18 @@ const HTML = String.raw`<!doctype html>
   </div>
 </header>
 <div id="layout">
-  <nav id="sidebar"><div id="tree"></div></nav>
+  <nav id="sidebar"><div id="tree"></div><div id="usage"></div></nav>
   <main>
     <div id="dropzone">Drag files here, or click Upload</div>
     <div id="progress"></div>
+    <div id="selectionBar" style="display:none">
+      <span id="selectionCount"></span>
+      <button id="bulkMoveBtn">Move to…</button>
+      <button id="bulkDeleteBtn" class="danger">Delete</button>
+      <button id="bulkClearBtn">Clear</button>
+    </div>
     <table>
-      <thead><tr><th>Name</th><th class="size">Size</th><th class="date" id="dateHeader">Modified</th><th></th></tr></thead>
+      <thead><tr><th class="sel"><input type="checkbox" id="selectAll" /></th><th>Name</th><th class="size">Size</th><th class="date" id="dateHeader">Modified</th><th></th></tr></thead>
       <tbody id="rows"></tbody>
     </table>
     <div id="empty" style="display:none"></div>
@@ -713,8 +844,12 @@ const HTML = String.raw`<!doctype html>
 </div>
 <script>
 var currentPrefix = "";
-var inTrash = false;
+var mode = "files"; // "files" | "trash" | "search"
+var searchQuery = "";
 var previewKey = null;
+var selected = [];
+var lastFiles = [];
+var searchTimer = null;
 
 function humanSize(bytes) {
   if (bytes === 0) return "0 B";
@@ -735,15 +870,55 @@ function checkAuth(res) {
   return res;
 }
 
-function setView(trash) {
-  inTrash = trash;
-  document.getElementById("newFolderBtn").style.display = trash ? "none" : "";
-  document.getElementById("uploadBtn").style.display = trash ? "none" : "";
+function setMode(m) {
+  mode = m;
+  var files = m === "files";
+  var trash = m === "trash";
+  document.getElementById("newFolderBtn").style.display = files ? "" : "none";
+  document.getElementById("uploadBtn").style.display = files ? "" : "none";
   document.getElementById("trashBtn").style.display = trash ? "none" : "";
   document.getElementById("backBtn").style.display = trash ? "" : "none";
   document.getElementById("emptyTrashBtn").style.display = trash ? "" : "none";
-  document.getElementById("dropzone").style.display = trash ? "none" : "";
+  document.getElementById("dropzone").style.display = files ? "" : "none";
   document.getElementById("dateHeader").textContent = trash ? "Deleted" : "Modified";
+  document.getElementById("selectAll").style.visibility = trash ? "hidden" : "";
+  if (m !== "search") document.getElementById("searchBox").value = "";
+  clearSelection();
+}
+
+// ---- Multi-select ----
+
+function toggleSelect(key, on) {
+  var i = selected.indexOf(key);
+  if (on && i === -1) selected.push(key);
+  if (!on && i !== -1) selected.splice(i, 1);
+  updateSelectionBar();
+}
+
+function clearSelection() {
+  selected = [];
+  var all = document.getElementById("selectAll");
+  if (all) all.checked = false;
+  updateSelectionBar();
+}
+
+function updateSelectionBar() {
+  document.getElementById("selectionBar").style.display = selected.length ? "flex" : "none";
+  document.getElementById("selectionCount").textContent = selected.length + " selected";
+}
+
+function makeSelTd(key) {
+  var td = document.createElement("td");
+  td.className = "sel";
+  if (key) {
+    var cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = selected.indexOf(key) !== -1;
+    cb.onchange = function () { toggleSelect(key, cb.checked); };
+    cb.onclick = function (e) { e.stopPropagation(); };
+    td.appendChild(cb);
+  }
+  return td;
 }
 
 function renderBreadcrumb() {
@@ -752,14 +927,14 @@ function renderBreadcrumb() {
 
   var root = document.createElement("span");
   root.textContent = "Home";
-  root.onclick = function () { setView(false); load(""); };
+  root.onclick = function () { setMode("files"); load(""); };
   makeDropTarget(root, "");
   bc.appendChild(root);
 
-  if (inTrash) {
+  if (mode !== "files") {
     bc.appendChild(document.createTextNode(" / "));
     var t = document.createElement("span");
-    t.textContent = "Trash";
+    t.textContent = mode === "trash" ? "Trash" : 'Search: "' + searchQuery + '"';
     bc.appendChild(t);
     return;
   }
@@ -819,6 +994,7 @@ function showEmpty(count, message) {
 
 function load(prefix) {
   currentPrefix = prefix;
+  clearSelection();
   renderBreadcrumb();
   return fetch("/api/list?prefix=" + encodeURIComponent(prefix))
     .then(checkAuth)
@@ -833,17 +1009,22 @@ function load(prefix) {
           { label: "Delete", onClick: function () { removeFolder(folder); } }
         ]);
         makeDropTarget(tr, folder);
+        tr.insertBefore(makeSelTd(null), tr.firstChild);
         rows.appendChild(tr);
       });
+
+      lastFiles = data.files.map(function (f) { return f.key; });
 
       data.files.forEach(function (file) {
         var name = file.key.slice(prefix.length);
         var tr = makeRow(name, "📄", humanSize(file.size), humanDate(file.uploaded),
           function () { openPreview(file.key); }, [
+            { label: "Share", onClick: function () { shareFile(file.key); } },
             { label: "Rename", onClick: function () { renameFile(file.key); } },
             { label: "Download", onClick: function () { download(file.key); } },
             { label: "Delete", onClick: function () { removeFile(file.key); } }
           ]);
+        tr.insertBefore(makeSelTd(file.key), tr.firstChild);
         tr.draggable = true;
         tr.addEventListener("dragstart", function (e) {
           e.dataTransfer.setData("application/x-drive-key", file.key);
@@ -866,12 +1047,15 @@ function loadTrash() {
       var rows = document.getElementById("rows");
       rows.innerHTML = "";
 
+      lastFiles = [];
       data.files.forEach(function (file) {
-        rows.appendChild(makeRow(file.original, "🗑️", humanSize(file.size), humanDate(file.deleted),
+        var tr = makeRow(file.original, "🗑️", humanSize(file.size), humanDate(file.deleted),
           null, [
             { label: "Restore", onClick: function () { restoreFile(file.key); } },
             { label: "Delete forever", danger: true, onClick: function () { purgeFile(file.key); } }
-          ]));
+          ]);
+        tr.insertBefore(makeSelTd(null), tr.firstChild);
+        rows.appendChild(tr);
       });
 
       showEmpty(data.files.length, "Trash is empty. Deleted files are kept here for 30 days.");
@@ -879,7 +1063,11 @@ function loadTrash() {
     });
 }
 
-function refresh() { return inTrash ? loadTrash() : load(currentPrefix); }
+function refresh() {
+  if (mode === "trash") return loadTrash();
+  if (mode === "search") return loadSearch();
+  return load(currentPrefix);
+}
 
 function download(key) {
   window.location = "/api/object?key=" + encodeURIComponent(key);
@@ -986,6 +1174,71 @@ function moveFile(key, destPrefix) {
     });
 }
 
+function loadSearch() {
+  clearSelection();
+  renderBreadcrumb();
+  return fetch("/api/search?q=" + encodeURIComponent(searchQuery))
+    .then(checkAuth)
+    .then(function (res) { return res.json(); })
+    .then(function (data) {
+      if (mode !== "search") return; // user navigated away while we were fetching
+      var rows = document.getElementById("rows");
+      rows.innerHTML = "";
+      lastFiles = data.files.map(function (f) { return f.key; });
+
+      data.files.forEach(function (file) {
+        var tr = makeRow(file.key, "📄", humanSize(file.size), humanDate(file.uploaded),
+          function () { openPreview(file.key); }, [
+            { label: "Share", onClick: function () { shareFile(file.key); } },
+            { label: "Rename", onClick: function () { renameFile(file.key); } },
+            { label: "Download", onClick: function () { download(file.key); } },
+            { label: "Delete", onClick: function () { removeFile(file.key); } }
+          ]);
+        tr.insertBefore(makeSelTd(file.key), tr.firstChild);
+        tr.draggable = true;
+        tr.addEventListener("dragstart", function (e) {
+          e.dataTransfer.setData("application/x-drive-key", file.key);
+          e.dataTransfer.effectAllowed = "move";
+        });
+        rows.appendChild(tr);
+      });
+
+      showEmpty(data.files.length, 'No files match "' + searchQuery + '".');
+      updateTreeActive();
+    });
+}
+
+function shareFile(key) {
+  var hours = prompt("Share link valid for how many hours? (max 168 = 7 days)", "24");
+  if (hours === null) return;
+  var ttl = Math.round(parseFloat(hours) * 3600);
+  if (!ttl || ttl < 0) { alert("Invalid duration."); return; }
+  fetch("/api/sign?key=" + encodeURIComponent(key) + "&ttl=" + ttl)
+    .then(checkAuth)
+    .then(function (res) { return res.json(); })
+    .then(function (data) {
+      var fallback = function () { prompt("Copy the share link:", data.url); };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(data.url).then(function () {
+          alert("Share link copied to clipboard. Anyone with it can open this file until it expires.");
+        }, fallback);
+      } else {
+        fallback();
+      }
+    });
+}
+
+function refreshUsage() {
+  fetch("/api/usage")
+    .then(checkAuth)
+    .then(function (res) { return res.json(); })
+    .then(function (u) {
+      var txt = humanSize(u.driveBytes) + " used · " + u.driveCount + " files";
+      if (u.trashBytes) txt += " · trash " + humanSize(u.trashBytes);
+      document.getElementById("usage").textContent = txt;
+    });
+}
+
 function isFileDrag(e) {
   return Array.prototype.indexOf.call(e.dataTransfer.types, "application/x-drive-key") !== -1;
 }
@@ -1056,7 +1309,7 @@ function treeNode(prefix, name, autoExpand) {
       });
   };
 
-  row.onclick = function () { setView(false); load(prefix); };
+  row.onclick = function () { setMode("files"); load(prefix); };
   makeDropTarget(row, prefix);
 
   wrap.appendChild(row);
@@ -1074,19 +1327,19 @@ function initTree() {
 function updateTreeActive() {
   var rowsEls = document.querySelectorAll(".treeRow");
   Array.prototype.forEach.call(rowsEls, function (r) {
-    r.classList.toggle("active", !inTrash && r.dataset.prefix === currentPrefix);
+    r.classList.toggle("active", mode === "files" && r.dataset.prefix === currentPrefix);
   });
 }
 
 function removeFile(key) {
   if (!confirm("Move " + key.split("/").pop() + " to the trash?")) return;
   fetch("/api/object?key=" + encodeURIComponent(key), { method: "DELETE" })
-    .then(checkAuth).then(refresh);
+    .then(checkAuth).then(function () { refreshUsage(); refresh(); });
 }
 
 function removeFolder(prefix) {
   if (!confirm("Move folder " + prefix + " and everything inside it to the trash?")) return;
-  deleteFolderContents(prefix).then(function () { initTree(); refresh(); });
+  deleteFolderContents(prefix).then(function () { initTree(); refreshUsage(); refresh(); });
 }
 
 // Recursively soft-deletes everything under prefix, then the folder marker itself.
@@ -1110,13 +1363,13 @@ function deleteFolderContents(prefix) {
 
 function restoreFile(key) {
   fetch("/api/trash/restore?key=" + encodeURIComponent(key), { method: "POST" })
-    .then(checkAuth).then(refresh);
+    .then(checkAuth).then(function () { refreshUsage(); refresh(); });
 }
 
 function purgeFile(key) {
   if (!confirm("Permanently delete " + key.split("/").pop() + "? This cannot be undone.")) return;
   fetch("/api/trash/object?key=" + encodeURIComponent(key), { method: "DELETE" })
-    .then(checkAuth).then(refresh);
+    .then(checkAuth).then(function () { refreshUsage(); refresh(); });
 }
 
 function uploadFiles(fileList) {
@@ -1126,6 +1379,7 @@ function uploadFiles(fileList) {
   function next() {
     if (i >= files.length) {
       progress.textContent = "";
+      refreshUsage();
       refresh();
       return;
     }
@@ -1151,12 +1405,13 @@ document.getElementById("newFolderBtn").onclick = function () {
     .then(checkAuth).then(function () { initTree(); refresh(); });
 };
 
-document.getElementById("trashBtn").onclick = function () { setView(true); loadTrash(); };
-document.getElementById("backBtn").onclick = function () { setView(false); load(currentPrefix); };
+document.getElementById("trashBtn").onclick = function () { setMode("trash"); loadTrash(); };
+document.getElementById("backBtn").onclick = function () { setMode("files"); load(currentPrefix); };
 
 document.getElementById("emptyTrashBtn").onclick = function () {
   if (!confirm("Permanently delete everything in the trash? This cannot be undone.")) return;
-  fetch("/api/trash/empty", { method: "POST" }).then(checkAuth).then(refresh);
+  fetch("/api/trash/empty", { method: "POST" })
+    .then(checkAuth).then(function () { refreshUsage(); refresh(); });
 };
 
 document.getElementById("logoutBtn").onclick = function () {
@@ -1181,9 +1436,65 @@ document.getElementById("previewOverlay").addEventListener("click", function (e)
 });
 document.addEventListener("keydown", function (e) { if (e.key === "Escape") closePreview(); });
 
-setView(false);
+document.getElementById("searchBox").oninput = function () {
+  var box = this;
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(function () {
+    var q = box.value.trim();
+    if (!q) {
+      if (mode === "search") { setMode("files"); load(currentPrefix); }
+      return;
+    }
+    searchQuery = q;
+    if (mode !== "search") setMode("search");
+    loadSearch();
+  }, 250);
+};
+
+document.getElementById("selectAll").onchange = function () {
+  var on = this.checked;
+  lastFiles.forEach(function (k) { toggleSelect(k, on); });
+  var cbs = document.querySelectorAll("#rows .sel input");
+  Array.prototype.forEach.call(cbs, function (c) { c.checked = on; });
+};
+
+document.getElementById("bulkClearBtn").onclick = function () {
+  clearSelection();
+  var cbs = document.querySelectorAll("#rows .sel input");
+  Array.prototype.forEach.call(cbs, function (c) { c.checked = false; });
+};
+
+document.getElementById("bulkDeleteBtn").onclick = function () {
+  if (!selected.length) return;
+  if (!confirm("Move " + selected.length + " file(s) to the trash?")) return;
+  Promise.all(selected.map(function (k) {
+    return fetch("/api/object?key=" + encodeURIComponent(k), { method: "DELETE" });
+  })).then(function () { clearSelection(); refreshUsage(); refresh(); });
+};
+
+document.getElementById("bulkMoveBtn").onclick = function () {
+  if (!selected.length) return;
+  var dest = prompt('Destination folder (empty = Home, e.g. "Documents/"):', currentPrefix);
+  if (dest === null) return;
+  dest = dest.trim();
+  if (dest && dest.charAt(dest.length - 1) !== "/") dest += "/";
+  var failed = 0;
+  Promise.all(selected.map(function (k) {
+    var to = dest + k.split("/").pop();
+    if (to === k) return Promise.resolve();
+    return fetch("/api/rename?from=" + encodeURIComponent(k) + "&to=" + encodeURIComponent(to), { method: "POST" })
+      .then(function (res) { if (!res.ok) failed++; });
+  })).then(function () {
+    if (failed) alert(failed + " file(s) could not be moved (same name already there?).");
+    clearSelection();
+    refresh();
+  });
+};
+
+setMode("files");
 initTree();
 load("");
+refreshUsage();
 </script>
 </body>
 </html>`;
