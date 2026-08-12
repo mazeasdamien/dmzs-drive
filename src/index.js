@@ -1127,7 +1127,12 @@ function load(prefix, fromHistory) {
         tr.dataset.key = file.key;
         tr.draggable = true;
         tr.addEventListener("dragstart", function (e) {
-          e.dataTransfer.setData("application/x-drive-key", file.key);
+          if (selected.length && selected.indexOf(file.key) !== -1) {
+            // Dragging a checked row drags the whole selection.
+            e.dataTransfer.setData("application/x-drive-keys", JSON.stringify(selected));
+          } else {
+            e.dataTransfer.setData("application/x-drive-key", file.key);
+          }
           e.dataTransfer.effectAllowed = "move";
         });
         tr.addEventListener("dragend", function () { lastDragEnd = Date.now(); });
@@ -1340,17 +1345,24 @@ function renameFile(key) {
   }
 }
 
+function moveKeys(keys, destPrefix) {
+  var failed = 0;
+  Promise.all(keys.map(function (k) {
+    var to = destPrefix + k.split("/").pop();
+    if (to === k) return Promise.resolve();
+    return fetch("/api/rename?from=" + encodeURIComponent(k) + "&to=" + encodeURIComponent(to), { method: "POST" })
+      .then(checkAuth)
+      .then(function (res) { if (!res.ok) failed++; });
+  })).then(function () {
+    if (failed) alert(failed + " file(s) could not be moved (same name already there?).");
+    clearSelection();
+    refresh();
+  });
+}
+
 function moveFile(key, destPrefix) {
   if (!key) return;
-  var name = key.split("/").pop();
-  var to = destPrefix + name;
-  if (to === key) return;
-  fetch("/api/rename?from=" + encodeURIComponent(key) + "&to=" + encodeURIComponent(to), { method: "POST" })
-    .then(checkAuth)
-    .then(function (res) {
-      if (res.status === 409) alert("Something named " + name + " already exists there.");
-      refresh();
-    });
+  moveKeys([key], destPrefix);
 }
 
 function loadSearch() {
@@ -1377,7 +1389,12 @@ function loadSearch() {
         tr.dataset.key = file.key;
         tr.draggable = true;
         tr.addEventListener("dragstart", function (e) {
-          e.dataTransfer.setData("application/x-drive-key", file.key);
+          if (selected.length && selected.indexOf(file.key) !== -1) {
+            // Dragging a checked row drags the whole selection.
+            e.dataTransfer.setData("application/x-drive-keys", JSON.stringify(selected));
+          } else {
+            e.dataTransfer.setData("application/x-drive-key", file.key);
+          }
           e.dataTransfer.effectAllowed = "move";
         });
         tr.addEventListener("dragend", function () { lastDragEnd = Date.now(); });
@@ -1422,6 +1439,7 @@ function refreshUsage() {
 
 function dragKind(e) {
   var t = e.dataTransfer.types;
+  if (Array.prototype.indexOf.call(t, "application/x-drive-keys") !== -1) return "files";
   if (Array.prototype.indexOf.call(t, "application/x-drive-key") !== -1) return "file";
   if (Array.prototype.indexOf.call(t, "application/x-drive-dir") !== -1) return "dir";
   return null;
@@ -1457,7 +1475,9 @@ function makeDropTarget(el, destPrefix) {
     e.preventDefault();
     e.stopPropagation();
     el.classList.remove("droptarget");
-    if (kind === "file") {
+    if (kind === "files") {
+      moveKeys(JSON.parse(e.dataTransfer.getData("application/x-drive-keys")), destPrefix);
+    } else if (kind === "file") {
       moveFile(e.dataTransfer.getData("application/x-drive-key"), destPrefix);
     } else {
       moveDir(e.dataTransfer.getData("application/x-drive-dir"), destPrefix);
@@ -1683,17 +1703,7 @@ document.getElementById("bulkMoveBtn").onclick = function () {
   if (dest === null) return;
   dest = dest.trim();
   if (dest && dest.charAt(dest.length - 1) !== "/") dest += "/";
-  var failed = 0;
-  Promise.all(selected.map(function (k) {
-    var to = dest + k.split("/").pop();
-    if (to === k) return Promise.resolve();
-    return fetch("/api/rename?from=" + encodeURIComponent(k) + "&to=" + encodeURIComponent(to), { method: "POST" })
-      .then(function (res) { if (!res.ok) failed++; });
-  })).then(function () {
-    if (failed) alert(failed + " file(s) could not be moved (same name already there?).");
-    clearSelection();
-    refresh();
-  });
+  moveKeys(selected.slice(), dest);
 };
 
 window.addEventListener("popstate", applyHash);
