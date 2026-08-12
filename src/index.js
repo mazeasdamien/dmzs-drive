@@ -1064,8 +1064,29 @@ function showEmpty(count, message) {
   el.style.display = count === 0 ? "block" : "none";
 }
 
-function load(prefix) {
+// Folder navigation is mirrored into the URL hash so the browser's
+// back/forward buttons walk the folder levels, and reloads keep the place.
+function pushPrefixHash(prefix) {
+  var h = "#/" + encodeURI(prefix);
+  if (location.hash === h) return;
+  if (!location.hash && prefix === "") {
+    history.replaceState(null, "", h);
+  } else {
+    history.pushState(null, "", h);
+  }
+}
+
+function applyHash() {
+  if (location.hash === "#trash") { setMode("trash"); loadTrash(); return; }
+  var prefix = "";
+  if (location.hash.indexOf("#/") === 0) prefix = decodeURI(location.hash.slice(2));
+  setMode("files");
+  load(prefix, true);
+}
+
+function load(prefix, fromHistory) {
   currentPrefix = prefix;
+  if (!fromHistory) pushPrefixHash(prefix);
   clearSelection();
   renderBreadcrumb();
   return fetch("/api/list?prefix=" + encodeURIComponent(prefix))
@@ -1589,7 +1610,11 @@ document.getElementById("newFolderBtn").onclick = function () {
     .then(checkAuth).then(function () { initTree(); refresh(); });
 };
 
-document.getElementById("trashBtn").onclick = function () { setMode("trash"); loadTrash(); };
+document.getElementById("trashBtn").onclick = function () {
+  setMode("trash");
+  if (location.hash !== "#trash") history.pushState(null, "", "#trash");
+  loadTrash();
+};
 document.getElementById("backBtn").onclick = function () { setMode("files"); load(currentPrefix); };
 
 document.getElementById("emptyTrashBtn").onclick = function () {
@@ -1675,9 +1700,11 @@ document.getElementById("bulkMoveBtn").onclick = function () {
   });
 };
 
+window.addEventListener("popstate", applyHash);
+
 setMode("files");
 initTree();
-load("");
+applyHash();
 refreshUsage();
 </script>
 </body>
