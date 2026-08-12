@@ -8,6 +8,10 @@
       "custom_domain": true
     }
   ],
+  "triggers": {
+    // Daily trash purge (entries older than 30 days).
+    "crons": ["17 3 * * *"]
+  },
   "r2_buckets": [
     {
       "binding": "DRIVE_BUCKET",

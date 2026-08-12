@@ -10,13 +10,19 @@ You'll need [Node.js](https://nodejs.org) installed. Then, from this folder:
 
 ```sh
 npx wrangler login       # opens a browser to authorize wrangler with your Cloudflare account
-npx wrangler secret put AUTH_PASS   # choose a password — you'll be prompted to type it
+npx wrangler secret put AUTH_PASS     # choose a password — you'll be prompted to type it
+npx wrangler secret put TOTP_SECRET   # base32 seed for the authenticator app (see below)
 npx wrangler deploy
 ```
 
-`wrangler deploy` will print a URL like `https://dmzs-drive.<your-subdomain>.workers.dev`.
-Open it, and your browser will prompt for a username/password — the username is
-`damien` (set in `wrangler.jsonc`), the password is whatever you just chose.
+The drive is served on the custom domain configured in `wrangler.jsonc`
+(`drive.agentxr.app`). Signing in asks for the password plus a 6-digit code
+from an authenticator app (Microsoft/Google Authenticator, etc.).
+
+To enroll the authenticator: generate a random base32 string (A–Z, 2–7; e.g.
+32 chars), store it as `TOTP_SECRET`, and add it to your authenticator app —
+either by typing it in manually or via a QR code encoding
+`otpauth://totp/dmzs-drive:damien?secret=<TOTP_SECRET>&issuer=dmzs-drive`.
 
 That's it — no build step, no database, no separate frontend hosting.
 
@@ -26,15 +32,19 @@ If you have a domain on Cloudflare, you can attach it instead of the `workers.de
 URL: Cloudflare dashboard → Workers & Pages → `dmzs-drive` → Settings → Domains &
 Routes → Add a custom domain.
 
-### About the password gate
+### About the login gate
 
-The whole thing is protected by HTTP Basic Auth, checked on every request. That's
-adequate for personal use over HTTPS (which Cloudflare terminates automatically),
-but it is a single shared password with no rate-limiting or 2FA. If you want
-stronger protection later — e.g. login via your Google/GitHub account, or
-restricting access to specific email addresses — Cloudflare Access (part of Zero
-Trust, free for small teams) can be layered in front of the Worker without
-changing any code.
+Every request is checked for a signed session cookie; sessions are created by
+`POST /api/login` with the password **and** a valid TOTP code, and last 30 days.
+Failed logins are slowed down (~800 ms) to blunt brute-forcing. Changing either
+secret invalidates all outstanding sessions. If you ever want to go further,
+Cloudflare Access (Zero Trust) can still be layered in front without code changes.
+
+### Trash
+
+Deleting a file moves it into a hidden `.trash/` area instead of destroying it.
+The Trash view in the UI lets you restore or permanently delete entries, and a
+daily cron (see `wrangler.jsonc`) purges anything older than 30 days.
 
 ## 2. Syncing a folder from your PC
 
