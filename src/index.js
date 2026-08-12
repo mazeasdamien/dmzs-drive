@@ -676,7 +676,7 @@ const HTML = String.raw`<!doctype html>
   #breadcrumb { font-size: 13px; color: var(--muted); margin-top: 4px; }
   #breadcrumb span { cursor: pointer; }
   #breadcrumb span:hover { color: var(--accent); }
-  main { max-width: 900px; margin: 0 auto; padding: 24px; }
+  main { flex: 1; min-width: 0; padding: 24px 32px; }
   #dropzone {
     border: 2px dashed var(--border);
     border-radius: 10px;
