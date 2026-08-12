@@ -99,6 +99,9 @@ export default {
       if (url.pathname === "/api/movedir" && request.method === "POST") {
         return await handleMoveDir(url, env);
       }
+      if (url.pathname === "/api/keys" && request.method === "GET") {
+        return await handleKeys(url, env);
+      }
       if (url.pathname === "/api/search" && request.method === "GET") {
         return await handleSearch(url, env);
       }
@@ -425,6 +428,21 @@ async function handleMkdir(url, env) {
   const folderKey = key.endsWith("/") ? key : key + "/";
   await env.DRIVE_BUCKET.put(folderKey, new Uint8Array());
   return new Response("OK");
+}
+
+// Raw keys under a prefix (folder markers included) — lets the client move a
+// folder key-by-key with a progress bar.
+async function handleKeys(url, env) {
+  const prefix = url.searchParams.get("prefix") || "";
+  if (prefix.startsWith(TRASH)) return new Response("Reserved prefix", { status: 400 });
+  const keys = [];
+  let cursor;
+  do {
+    const page = await env.DRIVE_BUCKET.list({ prefix, cursor });
+    keys.push(...page.objects.map((o) => o.key));
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+  return Response.json({ keys });
 }
 
 // Moves a whole "folder" (every object under the prefix) to a new prefix.
@@ -779,7 +797,22 @@ const HTML = String.raw`<!doctype html>
   .actions { text-align: right; white-space: nowrap; }
   .actions button { padding: 3px 8px; font-size: 12px; margin-left: 4px; }
   #empty { color: var(--muted); text-align: center; padding: 40px 0; }
-  #progress { font-size: 13px; color: var(--muted); margin-bottom: 12px; }
+  #progress { font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+  #progressBarWrap {
+    display: none;
+    height: 6px;
+    border-radius: 3px;
+    background: var(--hover);
+    overflow: hidden;
+    margin-bottom: 12px;
+  }
+  #progressBarFill {
+    height: 100%;
+    width: 0%;
+    background: var(--accent);
+    border-radius: 3px;
+    transition: width .2s;
+  }
   #layout { display: flex; }
   #sidebar {
     width: 220px;
@@ -951,6 +984,7 @@ const HTML = String.raw`<!doctype html>
   <main>
     <div id="dropzone">Drag files here, or click Upload</div>
     <div id="progress"></div>
+    <div id="progressBarWrap"><div id="progressBarFill"></div></div>
     <div id="selectionBar" style="display:none">
       <span id="selectionCount"></span>
       <button id="bulkMoveBtn">Move to…</button>
@@ -1193,15 +1227,7 @@ function renameFolder(folder) {
   if (input.indexOf("/") !== -1) { alert("The name cannot contain /"); return; }
   var parent = folder.slice(0, folder.length - name.length - 1);
   var to = parent + input + "/";
-  fetch("/api/movedir?from=" + encodeURIComponent(folder) + "&to=" + encodeURIComponent(to), { method: "POST" })
-    .then(checkAuth)
-    .then(function (res) {
-      if (!res.ok) return res.text().then(function (t) { alert(t); });
-      return res.json().then(function (r) {
-        if (r.failed) alert(r.failed + " item(s) could not be moved (name conflicts).");
-      });
-    })
-    .then(function () { initTree(); refresh(); });
+  movePrefixWithProgress(folder, to, input);
 }
 
 function load(prefix, fromHistory) {
@@ -1645,14 +1671,24 @@ function renameFile(key) {
 }
 
 function moveKeys(keys, destPrefix) {
-  var failed = 0;
+  if (!keys.length) return;
+  var failed = 0, done = 0;
+  setProgress("Moving: 0/" + keys.length, 0, keys.length);
   Promise.all(keys.map(function (k) {
     var to = destPrefix + k.split("/").pop();
-    if (to === k) return Promise.resolve();
+    if (to === k) {
+      done++;
+      return Promise.resolve();
+    }
     return fetch("/api/rename?from=" + encodeURIComponent(k) + "&to=" + encodeURIComponent(to), { method: "POST" })
       .then(checkAuth)
-      .then(function (res) { if (!res.ok) failed++; });
+      .then(function (res) {
+        if (!res.ok) failed++;
+        done++;
+        setProgress("Moving: " + done + "/" + keys.length, done, keys.length);
+      });
   })).then(function () {
+    hideProgress();
     if (failed) alert(failed + " file(s) could not be moved (same name already there?).");
     clearSelection();
     refresh();
@@ -1788,10 +1824,9 @@ function listAllFiles(prefix) {
 }
 
 function backupDrive() {
-  var progress = document.getElementById("progress");
-  progress.textContent = "Preparing backup…";
+  setProgress("Preparing backup…", 0, 1);
   listAllFiles("").then(function (files) {
-    if (!files.length) { progress.textContent = ""; alert("Nothing to back up."); return; }
+    if (!files.length) { hideProgress(); alert("Nothing to back up."); return; }
     var enc = new TextEncoder();
     var parts = [];
     var central = [];
@@ -1801,7 +1836,7 @@ function backupDrive() {
     function next() {
       if (i >= files.length) { finish(); return; }
       var f = files[i];
-      progress.textContent = "Backing up " + (i + 1) + "/" + files.length + ": " + f.key;
+      setProgress("Backing up " + (i + 1) + "/" + files.length + ": " + f.key, i, files.length);
       fetch("/api/object?key=" + encodeURIComponent(f.key))
         .then(checkAuth)
         .then(function (r) { return r.arrayBuffer(); })
@@ -1864,7 +1899,7 @@ function backupDrive() {
       document.body.appendChild(a);
       a.click();
       setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 10000);
-      progress.textContent = "";
+      hideProgress();
     }
 
     next();
@@ -1879,20 +1914,53 @@ function dragKind(e) {
   return null;
 }
 
+// Moves every object under srcPrefix to destPrefix key-by-key so the progress
+// bar can track it; a few transfers run in parallel.
+function movePrefixWithProgress(srcPrefix, destPrefix, label) {
+  fetch("/api/keys?prefix=" + encodeURIComponent(srcPrefix))
+    .then(checkAuth)
+    .then(function (res) { return res.json(); })
+    .then(function (data) {
+      var keys = data.keys;
+      if (!keys.length) { initTree(); refresh(); return; }
+      var idx = 0, active = 0, done = 0, failed = 0;
+      setProgress("Moving " + label + ": 0/" + keys.length, 0, keys.length);
+      function pump() {
+        while (active < 3 && idx < keys.length) {
+          (function (k) {
+            active++;
+            var target = destPrefix + k.slice(srcPrefix.length);
+            fetch("/api/rename?from=" + encodeURIComponent(k) + "&to=" + encodeURIComponent(target), { method: "POST" })
+              .then(checkAuth)
+              .then(function (res) {
+                if (!res.ok) failed++;
+                active--;
+                done++;
+                setProgress("Moving " + label + ": " + done + "/" + keys.length, done, keys.length);
+                if (done === keys.length) {
+                  hideProgress();
+                  if (failed) alert(failed + " item(s) could not be moved (name conflicts) and stayed in place.");
+                  initTree();
+                  refresh();
+                } else {
+                  pump();
+                }
+              });
+          })(keys[idx]);
+          idx++;
+        }
+      }
+      pump();
+    });
+}
+
 function moveDir(srcPrefix, destPrefix) {
   if (!srcPrefix) return;
   var name = srcPrefix.replace(/\/$/, "").split("/").pop();
   var to = destPrefix + name + "/";
   if (to === srcPrefix) return;
   if (to.indexOf(srcPrefix) === 0) { alert("Cannot move a folder inside itself."); return; }
-  fetch("/api/movedir?from=" + encodeURIComponent(srcPrefix) + "&to=" + encodeURIComponent(to), { method: "POST" })
-    .then(checkAuth)
-    .then(function (res) { return res.ok ? res.json() : { failed: 0 }; })
-    .then(function (r) {
-      if (r.failed) alert(r.failed + " item(s) could not be moved (name conflicts) and stayed in place.");
-      initTree();
-      refresh();
-    });
+  movePrefixWithProgress(srcPrefix, to, name);
 }
 
 function makeDropTarget(el, destPrefix) {
@@ -2027,19 +2095,31 @@ function purgeFile(key) {
     .then(checkAuth).then(function () { refreshUsage(); refresh(); });
 }
 
+function setProgress(text, done, total) {
+  document.getElementById("progress").textContent = text;
+  document.getElementById("progressBarWrap").style.display = "block";
+  var pct = total ? Math.round((done / total) * 100) : 0;
+  document.getElementById("progressBarFill").style.width = pct + "%";
+}
+
+function hideProgress() {
+  document.getElementById("progress").textContent = "";
+  document.getElementById("progressBarWrap").style.display = "none";
+  document.getElementById("progressBarFill").style.width = "0%";
+}
+
 function uploadItems(items) {
-  var progress = document.getElementById("progress");
   var i = 0;
   function next() {
     if (i >= items.length) {
-      progress.textContent = "";
+      hideProgress();
       refreshUsage();
       initTree();
       refresh();
       return;
     }
     var it = items[i];
-    progress.textContent = "Uploading " + (i + 1) + "/" + items.length + ": " + it.relPath;
+    setProgress("Uploading " + (i + 1) + "/" + items.length + ": " + it.relPath, i, items.length);
     fetch("/api/object?key=" + encodeURIComponent(currentPrefix + it.relPath), {
       method: "PUT",
       headers: { "content-type": it.file.type || "application/octet-stream" },
