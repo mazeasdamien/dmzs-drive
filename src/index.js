@@ -1213,6 +1213,11 @@ function renameFile(key) {
   var newName = prompt("Rename to:", oldName);
   if (!newName || newName === oldName) return;
   if (newName.indexOf("/") !== -1) { alert("The name cannot contain /"); return; }
+  // Keep the old extension if the new name doesn't provide one.
+  var oldDot = oldName.lastIndexOf(".");
+  if (oldDot > 0 && newName.indexOf(".") === -1) {
+    newName += oldName.slice(oldDot);
+  }
   var to = key.slice(0, key.length - oldName.length) + newName;
   fetch("/api/rename?from=" + encodeURIComponent(key) + "&to=" + encodeURIComponent(to), { method: "POST" })
     .then(checkAuth)
