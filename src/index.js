@@ -328,10 +328,19 @@ async function handleDownload(url, env) {
   const filename = key.split("/").pop();
   if (url.searchParams.get("view") === "1") {
     // Inline viewing (PDFs, images, text render natively in the browser).
+    let ct = (headers.get("content-type") || "").toLowerCase();
+    // Files stored without a useful type (e.g. uploaded without an extension)
+    // get sniffed from their first bytes so PDFs and images still preview.
+    if (!ct || ct === "application/octet-stream") {
+      const head = await env.DRIVE_BUCKET.get(key, { range: { offset: 0, length: 16 } });
+      if (head) {
+        const sniffed = sniffType(new Uint8Array(await head.arrayBuffer()));
+        if (sniffed) { ct = sniffed; headers.set("content-type", sniffed); }
+      }
+    }
     // Script-capable types are downgraded to plain text so an uploaded HTML/SVG
     // file can never run JavaScript inside the drive's origin.
     // (careful: Office mime types contain "openxmlformats" — don't match those)
-    const ct = (headers.get("content-type") || "").toLowerCase();
     const scriptCapable = ct.includes("html") || ct.includes("svg") ||
       ct.startsWith("text/xml") || ct.startsWith("application/xml") || ct.includes("+xml");
     if (scriptCapable) {
@@ -342,6 +351,16 @@ async function handleDownload(url, env) {
     headers.set("Content-Disposition", `attachment; filename="${filename}"`);
   }
   return new Response(object.body, { headers });
+}
+
+function sniffType(b) {
+  const ascii = String.fromCharCode(...b.slice(0, 12));
+  if (ascii.startsWith("%PDF")) return "application/pdf";
+  if (b[0] === 0x89 && ascii.slice(1, 4) === "PNG") return "image/png";
+  if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return "image/jpeg";
+  if (ascii.startsWith("GIF8")) return "image/gif";
+  if (ascii.startsWith("RIFF") && ascii.slice(8, 12) === "WEBP") return "image/webp";
+  return null;
 }
 
 async function handleSoftDelete(url, env) {
@@ -850,6 +869,7 @@ var previewKey = null;
 var selected = [];
 var lastFiles = [];
 var searchTimer = null;
+var lastDragEnd = 0;
 
 function humanSize(bytes) {
   if (bytes === 0) return "0 B";
@@ -959,7 +979,13 @@ function makeRow(nameText, icon, sizeText, dateText, onNameClick, actionButtons)
   var nameTd = document.createElement("td");
   nameTd.className = "name";
   nameTd.textContent = icon + " " + nameText;
-  if (onNameClick) nameTd.onclick = onNameClick;
+  if (onNameClick) {
+    nameTd.onclick = function () {
+      // swallow the phantom click that can follow a drag gesture
+      if (Date.now() - lastDragEnd < 400) return;
+      onNameClick();
+    };
+  }
   tr.appendChild(nameTd);
 
   var sizeTd = document.createElement("td");
@@ -1030,6 +1056,7 @@ function load(prefix) {
           e.dataTransfer.setData("application/x-drive-key", file.key);
           e.dataTransfer.effectAllowed = "move";
         });
+        tr.addEventListener("dragend", function () { lastDragEnd = Date.now(); });
         rows.appendChild(tr);
       });
 
@@ -1138,10 +1165,44 @@ function openPreview(key) {
         body.appendChild(frame);
       });
   } else {
-    var msg = document.createElement("div");
-    msg.className = "noPreview";
-    msg.textContent = "No preview available for this file type.";
-    body.appendChild(msg);
+    // Unknown extension: ask the server, which sniffs the file's first bytes,
+    // then render according to the actual content type.
+    var probe = document.createElement("div");
+    probe.className = "noPreview";
+    probe.textContent = "Loading preview…";
+    body.appendChild(probe);
+    fetch(inlineUrl)
+      .then(checkAuth)
+      .then(function (res) {
+        var ct = (res.headers.get("content-type") || "").toLowerCase();
+        if (res.body && res.body.cancel) res.body.cancel();
+        if (previewKey !== key) return;
+        body.innerHTML = "";
+        if (ct.indexOf("image/") === 0) {
+          var img2 = document.createElement("img");
+          img2.src = inlineUrl;
+          body.appendChild(img2);
+        } else if (ct === "application/pdf" || ct.indexOf("text/") === 0) {
+          var frame2 = document.createElement("iframe");
+          frame2.src = inlineUrl;
+          body.appendChild(frame2);
+        } else if (ct.indexOf("audio/") === 0) {
+          var au2 = document.createElement("audio");
+          au2.controls = true;
+          au2.src = inlineUrl;
+          body.appendChild(au2);
+        } else if (ct.indexOf("video/") === 0) {
+          var vid2 = document.createElement("video");
+          vid2.controls = true;
+          vid2.src = inlineUrl;
+          body.appendChild(vid2);
+        } else {
+          var msg = document.createElement("div");
+          msg.className = "noPreview";
+          msg.textContent = "No preview available for this file type — use Download.";
+          body.appendChild(msg);
+        }
+      });
   }
 }
 
@@ -1200,6 +1261,7 @@ function loadSearch() {
           e.dataTransfer.setData("application/x-drive-key", file.key);
           e.dataTransfer.effectAllowed = "move";
         });
+        tr.addEventListener("dragend", function () { lastDragEnd = Date.now(); });
         rows.appendChild(tr);
       });
 
