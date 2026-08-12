@@ -892,9 +892,23 @@ const HTML = String.raw`<!doctype html>
   .tile .tname { font-size: 12px; padding: 6px 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .tile .tilecb { position: absolute; top: 6px; left: 6px; display: none; accent-color: var(--accent); }
   .tile:hover .tilecb, .tile .tilecb:checked { display: block; }
-  .tile .tacts { position: absolute; top: 4px; right: 4px; display: none; gap: 2px; }
+  .tile .tacts { position: absolute; top: 4px; right: 4px; display: none; gap: 3px; }
   .tile:hover .tacts { display: flex; }
-  .tile .tacts button { padding: 2px 6px; font-size: 12px; border-radius: 5px; background: var(--bg); }
+  .tile .tacts button {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--muted);
+    box-shadow: 0 1px 4px rgba(0, 0, 0, .15);
+  }
+  .tile .tacts button:hover { color: var(--accent); background: var(--bg); }
+  .tile .tacts button.danger:hover { color: var(--danger); }
+  .tile .tacts svg { display: block; }
   .tile.droptarget { outline: 2px solid var(--accent); outline-offset: -2px; }
   @keyframes flashRow {
     from { background: rgba(37, 99, 235, .28); }
@@ -1322,13 +1336,21 @@ function renderListRows(data, prefix) {
   });
 }
 
+var ICONS = {
+  share: "<svg viewBox='0 0 24 24' width='14' height='14' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7'/><path d='M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7'/></svg>",
+  rename: "<svg viewBox='0 0 24 24' width='14' height='14' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z'/></svg>",
+  download: "<svg viewBox='0 0 24 24' width='14' height='14' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4'/><polyline points='7 10 12 15 17 10'/><line x1='12' y1='15' x2='12' y2='3'/></svg>",
+  trash: "<svg viewBox='0 0 24 24' width='14' height='14' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><polyline points='3 6 5 6 21 6'/><path d='M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6'/><path d='M10 11v6'/><path d='M14 11v6'/><path d='M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2'/></svg>"
+};
+
 function tileActions(buttons) {
   var d = document.createElement("div");
   d.className = "tacts";
   buttons.forEach(function (b) {
     var btn = document.createElement("button");
-    btn.textContent = b.label;
+    btn.innerHTML = ICONS[b.icon];
     btn.title = b.title;
+    if (b.danger) btn.className = "danger";
     btn.onclick = function (e) { e.stopPropagation(); b.onClick(); };
     d.appendChild(btn);
   });
@@ -1354,8 +1376,8 @@ function renderGrid(data, prefix) {
     nm.title = name;
     tile.appendChild(nm);
     tile.appendChild(tileActions([
-      { label: "✏️", title: "Rename", onClick: function () { renameFolder(folder); } },
-      { label: "🗑", title: "Delete", onClick: function () { removeFolder(folder); } }
+      { icon: "rename", title: "Rename", onClick: function () { renameFolder(folder); } },
+      { icon: "trash", title: "Delete", danger: true, onClick: function () { removeFolder(folder); } }
     ]));
     tile.onclick = function () {
       if (Date.now() - lastDragEnd < 400) return;
@@ -1402,10 +1424,10 @@ function renderGrid(data, prefix) {
     tile.appendChild(cb);
 
     tile.appendChild(tileActions([
-      { label: "🔗", title: "Share", onClick: function () { shareFile(file.key); } },
-      { label: "✏️", title: "Rename", onClick: function () { renameFile(file.key); } },
-      { label: "⬇", title: "Download", onClick: function () { download(file.key); } },
-      { label: "🗑", title: "Delete", onClick: function () { removeFile(file.key); } }
+      { icon: "share", title: "Share", onClick: function () { shareFile(file.key); } },
+      { icon: "rename", title: "Rename", onClick: function () { renameFile(file.key); } },
+      { icon: "download", title: "Download", onClick: function () { download(file.key); } },
+      { icon: "trash", title: "Delete", danger: true, onClick: function () { removeFile(file.key); } }
     ]));
 
     tile.onclick = function () {
