@@ -2074,8 +2074,9 @@ function treeNode(prefix, name, autoExpand) {
       .then(function (res) { return res.json(); })
       .then(function (data) {
         data.folders.forEach(function (sub) {
-          // Children expand themselves too, so the whole tree is always open.
-          children.appendChild(treeNode(sub.prefix, sub.prefix.slice(prefix.length).replace(/\/$/, ""), true));
+          // Children start collapsed: the tree shows two levels by default,
+          // deeper ones open on demand via the arrows.
+          children.appendChild(treeNode(sub.prefix, sub.prefix.slice(prefix.length).replace(/\/$/, "")));
         });
         if (data.folders.length === 0) arrow.style.visibility = "hidden";
       });
