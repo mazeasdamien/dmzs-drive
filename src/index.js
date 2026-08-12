@@ -1082,14 +1082,25 @@ function showEmpty(count, message) {
 
 // Folder navigation is mirrored into the URL hash so the browser's
 // back/forward buttons walk the folder levels, and reloads keep the place.
+// The whole ancestor chain is pushed each time, so Back always goes UP one
+// level (Rennes -> France -> Home) even after jumping straight to a deep
+// folder from the tree.
 function pushPrefixHash(prefix) {
-  var h = "#/" + encodeURI(prefix);
-  if (location.hash === h) return;
-  if (!location.hash && prefix === "") {
-    history.replaceState(null, "", h);
-  } else {
-    history.pushState(null, "", h);
-  }
+  var chain = [""];
+  var acc = "";
+  prefix.split("/").filter(Boolean).forEach(function (p) {
+    acc += p + "/";
+    chain.push(acc);
+  });
+  chain.forEach(function (pfx) {
+    var h = "#/" + encodeURI(pfx);
+    if (location.hash === h) return;
+    if (!location.hash && pfx === "") {
+      history.replaceState(null, "", h);
+    } else {
+      history.pushState(null, "", h);
+    }
+  });
 }
 
 function applyHash() {
