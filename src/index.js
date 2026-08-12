@@ -1210,21 +1210,47 @@ function openPreview(key) {
 
 function renameFile(key) {
   var oldName = key.split("/").pop();
-  var newName = prompt("Rename to:", oldName);
-  if (!newName || newName === oldName) return;
-  if (newName.indexOf("/") !== -1) { alert("The name cannot contain /"); return; }
-  // Keep the old extension if the new name doesn't provide one.
+  var input = prompt("Rename to:", oldName);
+  if (input === null) return;
+  input = input.trim();
+  if (!input) return;
+  if (input.indexOf("/") !== -1) { alert("The name cannot contain /"); return; }
+
+  var finishRename = function (newName) {
+    if (newName === oldName) return;
+    var to = key.slice(0, key.length - oldName.length) + newName;
+    fetch("/api/rename?from=" + encodeURIComponent(key) + "&to=" + encodeURIComponent(to), { method: "POST" })
+      .then(checkAuth)
+      .then(function (res) {
+        if (res.status === 409) alert("A file named " + newName + " already exists here.");
+        refresh();
+      });
+  };
+
   var oldDot = oldName.lastIndexOf(".");
-  if (oldDot > 0 && newName.indexOf(".") === -1) {
-    newName += oldName.slice(oldDot);
+  if (input.indexOf(".") === -1 && oldDot > 0) {
+    // Keep the old extension when the new name doesn't provide one.
+    finishRename(input + oldName.slice(oldDot));
+  } else if (input.indexOf(".") === -1) {
+    // No extension anywhere: ask the server what the file really is (it
+    // sniffs the first bytes) and append the matching extension.
+    fetch("/api/object?key=" + encodeURIComponent(key) + "&view=1")
+      .then(checkAuth)
+      .then(function (res) {
+        var ct = (res.headers.get("content-type") || "").toLowerCase().split(";")[0];
+        if (res.body && res.body.cancel) res.body.cancel();
+        var map = {
+          "application/pdf": ".pdf",
+          "image/png": ".png",
+          "image/jpeg": ".jpg",
+          "image/gif": ".gif",
+          "image/webp": ".webp"
+        };
+        finishRename(input + (map[ct] || ""));
+      });
+  } else {
+    finishRename(input);
   }
-  var to = key.slice(0, key.length - oldName.length) + newName;
-  fetch("/api/rename?from=" + encodeURIComponent(key) + "&to=" + encodeURIComponent(to), { method: "POST" })
-    .then(checkAuth)
-    .then(function (res) {
-      if (res.status === 409) alert("A file named " + newName + " already exists here.");
-      refresh();
-    });
 }
 
 function moveFile(key, destPrefix) {
