@@ -245,7 +245,19 @@ async function handleDownload(url, env) {
   const headers = new Headers();
   object.writeHttpMetadata(headers);
   headers.set("etag", object.httpEtag);
-  headers.set("Content-Disposition", `attachment; filename="${key.split("/").pop()}"`);
+  const filename = key.split("/").pop();
+  if (url.searchParams.get("view") === "1") {
+    // Inline viewing (PDFs, images, text render natively in the browser).
+    // Script-capable types are downgraded to plain text so an uploaded HTML/SVG
+    // file can never run JavaScript inside the drive's origin.
+    const ct = (headers.get("content-type") || "").toLowerCase();
+    if (ct.includes("html") || ct.includes("svg") || ct.includes("xml")) {
+      headers.set("content-type", "text/plain;charset=UTF-8");
+    }
+    headers.set("Content-Disposition", `inline; filename="${filename}"`);
+  } else {
+    headers.set("Content-Disposition", `attachment; filename="${filename}"`);
+  }
   return new Response(object.body, { headers });
 }
 
@@ -693,7 +705,7 @@ function load(prefix) {
       data.files.forEach(function (file) {
         var name = file.key.slice(prefix.length);
         rows.appendChild(makeRow(name, "📄", humanSize(file.size), humanDate(file.uploaded),
-          function () { download(file.key); }, [
+          function () { view(file.key); }, [
             { label: "Download", onClick: function () { download(file.key); } },
             { label: "Delete", onClick: function () { removeFile(file.key); } }
           ]));
@@ -728,6 +740,10 @@ function refresh() { return inTrash ? loadTrash() : load(currentPrefix); }
 
 function download(key) {
   window.location = "/api/object?key=" + encodeURIComponent(key);
+}
+
+function view(key) {
+  window.open("/api/object?key=" + encodeURIComponent(key) + "&view=1", "_blank");
 }
 
 function removeFile(key) {
