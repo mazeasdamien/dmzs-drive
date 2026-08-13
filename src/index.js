@@ -1459,8 +1459,29 @@ var searchTimer = null;
 var lastDragEnd = 0;
 var sortBy = "name";
 var sortDir = 1;
-// Both the grid (thumbnail via a still frame) and the preview need this list.
+// Both the grid (thumbnail via a still frame) and the preview need these.
 var VIDEO_EXTS = ["mp4", "webm", "mov", "m4v"];
+var IMAGE_EXTS = ["png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "ico"];
+// Only photos and videos can have a real thumbnail — nothing on the platform
+// rasterises a PDF or a slide deck. So the rest lean on the icon to say what
+// they are, rather than every one of them being the same sheet of paper.
+var FILE_ICONS = {
+  pdf: "📕",
+  doc: "📘", docx: "📘", odt: "📘", rtf: "📘", pages: "📘",
+  xls: "📊", xlsx: "📊", csv: "📊", ods: "📊", numbers: "📊",
+  ppt: "📙", pptx: "📙", odp: "📙", key: "📙",
+  zip: "📦", rar: "📦", "7z": "📦", tar: "📦", gz: "📦",
+  mp3: "🎵", wav: "🎵", m4a: "🎵", ogg: "🎵", flac: "🎵",
+  js: "📜", json: "📜", html: "📜", htm: "📜", css: "📜", py: "📜", sh: "📜",
+  xml: "📜", yml: "📜", yaml: "📜", ini: "📜"
+};
+
+function iconFor(key) {
+  var ext = extOf(key);
+  if (IMAGE_EXTS.indexOf(ext) !== -1) return "🖼️";
+  if (VIDEO_EXTS.indexOf(ext) !== -1) return "🎬";
+  return FILE_ICONS[ext] || "📄";
+}
 
 function humanSize(bytes) {
   if (bytes === 0) return "0 B";
@@ -2120,7 +2141,7 @@ function renderListRows(data, prefix) {
 
   data.files.forEach(function (file) {
     var name = file.key.slice(prefix.length);
-    var tr = makeRow(name, "📄", humanSize(file.size), humanDate(file.uploaded), [
+    var tr = makeRow(name, iconFor(file.key), humanSize(file.size), humanDate(file.uploaded), [
       { label: "Share", onClick: function () { shareFile(file.key); } },
       { label: "Rename", onClick: function () { renameFile(file.key); } },
       { label: "Download", onClick: function () { download(file.key); } },
@@ -2181,7 +2202,6 @@ function fileIcon(emoji) {
 
 function renderGrid(data, prefix) {
   var grid = document.getElementById("grid");
-  var imgExts = ["png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "ico"];
 
   data.folders.forEach(function (f) {
     var folder = f.prefix;
@@ -2213,7 +2233,7 @@ function renderGrid(data, prefix) {
     tile.className = "tile";
     var ext = extOf(file.key);
     var isVid = VIDEO_EXTS.indexOf(ext) !== -1;
-    if (imgExts.indexOf(ext) !== -1 || isVid) {
+    if (IMAGE_EXTS.indexOf(ext) !== -1 || isVid) {
       var im = document.createElement("img");
       im.className = "thumb";
       im.loading = "lazy";
@@ -2242,7 +2262,7 @@ function renderGrid(data, prefix) {
       tile.appendChild(im);
       if (badge) tile.appendChild(badge);
     } else {
-      tile.appendChild(fileIcon("📄"));
+      tile.appendChild(fileIcon(iconFor(file.key)));
     }
     var nm = document.createElement("div");
     nm.className = "tname";
@@ -2464,7 +2484,7 @@ function openPreview(key) {
 
   var inlineUrl = "/api/object?key=" + encodeURIComponent(key) + "&view=1";
   var ext = extOf(key);
-  var images = ["png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "ico"];
+  var images = IMAGE_EXTS;
   var texts = ["txt", "md", "csv", "json", "js", "css", "html", "htm", "xml", "svg", "log", "yml", "yaml", "ini", "py", "sh"];
   var office = ["doc", "docx", "xls", "xlsx", "ppt", "pptx"];
   var audios = ["mp3", "wav", "m4a", "ogg", "flac"];
@@ -2697,7 +2717,7 @@ function loadSearch() {
       lastItems = lastFiles.slice();
 
       data.files.forEach(function (file) {
-        var tr = makeRow(file.key, "📄", humanSize(file.size), humanDate(file.uploaded), [
+        var tr = makeRow(file.key, iconFor(file.key), humanSize(file.size), humanDate(file.uploaded), [
           { label: "Share", onClick: function () { shareFile(file.key); } },
           { label: "Rename", onClick: function () { renameFile(file.key); } },
           { label: "Download", onClick: function () { download(file.key); } },

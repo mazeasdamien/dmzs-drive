@@ -36,6 +36,12 @@ Cloudflare's cache, keyed by the object's etag. A video the Media binding can't
 read (an unsupported codec, or over its 100 MB input limit) falls back to a 🎬
 icon.
 
+Nothing on the platform rasterises a PDF or a slide deck, so those can't have
+a real thumbnail. They lean on the icon to say what they are instead — 📕 PDF,
+📘 documents, 📊 spreadsheets, 📙 slides, 📦 archives, 🎵 audio, 📜 code —
+rather than every one of them being the same sheet of paper. Grid and list use
+the same icons.
+
 Previews open in-page: PDFs, images, text, audio and video render directly in
 the browser. Word/Excel/PowerPoint files render through Microsoft's embedded
 Office viewer, which fetches the document via a short-lived (5 min) signed link
