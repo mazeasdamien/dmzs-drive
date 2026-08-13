@@ -7,6 +7,27 @@ multi-select), share via expiring links, download, and delete — all from a
 browser. Installable as an app (PWA) on mobile, with storage usage shown in
 the sidebar.
 
+The file list behaves like a desktop file manager: **one click selects, a
+double click opens** — files preview, folders open. Ctrl/Cmd-click adds to the
+selection, Shift-click takes a range, Ctrl/Cmd+A selects everything in the
+folder, Enter opens the selected item, Esc clears, and dragging a box across
+blank space rubber-band-selects whatever it touches (hold Ctrl while dragging
+to add to the current selection). The checkboxes still work too. Folders can be
+selected alongside files, so Move and Delete in the selection bar act on both —
+a folder brings everything inside it along. Dragging any selected item onto a
+folder moves the whole selection.
+
+On phones and tablets a single tap still opens, since double-tap is an awkward
+gesture there; use the checkboxes to select several items.
+
+Below 700px the layout goes compact: the folder tree slides in from a **☰**
+button, the toolbar keeps only search, the view toggle and Upload while the rest
+of the actions move into a **⋯** menu, and each row or tile carries its own **⋯**
+instead of four buttons — which is what leaves the file name room to be read.
+Because a touchscreen has no hover, the tile checkboxes and action buttons that
+appear on hover elsewhere are shown permanently there, and the drag-and-drop
+zone (useless from a phone) is hidden.
+
 Previews open in-page: PDFs, images, text, audio and video render directly in
 the browser. Word/Excel/PowerPoint files render through Microsoft's embedded
 Office viewer, which fetches the document via a short-lived (5 min) signed link

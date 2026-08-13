@@ -18,6 +18,11 @@
       "bucket_name": "dmzs-drive"
     }
   ],
+  // Resizes photos into grid thumbnails on the fly (see /api/thumb). Nothing
+  // extra is stored — the small copies live only in Cloudflare's cache.
+  "images": {
+    "binding": "IMAGES"
+  },
   "vars": {
     // Basic-auth username. Not secret, fine to keep here.
     "AUTH_USER": "damien"

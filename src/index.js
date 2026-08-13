@@ -49,7 +49,7 @@ const MANIFEST = {
 };
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     if (url.pathname === "/api/login" && request.method === "POST") {
@@ -92,6 +92,9 @@ export default {
         if (request.method === "PUT") return await handleUpload(request, url, env);
         if (request.method === "GET") return await handleDownload(url, env);
         if (request.method === "DELETE") return await handleSoftDelete(url, env);
+      }
+      if (url.pathname === "/api/thumb" && request.method === "GET") {
+        return await handleThumb(request, url, env, ctx);
       }
       if (url.pathname === "/api/mkdir" && request.method === "POST") {
         return await handleMkdir(url, env);
@@ -512,6 +515,70 @@ async function handleRename(url, env) {
   return new Response("OK");
 }
 
+// ---------- Thumbnails ----------
+
+// The grid used to point its tiles at the original photos and let CSS shrink
+// them, so browsing a folder of 3 MB JPEGs meant decoding hundreds of megabytes.
+// This resizes the R2 bytes through the Images binding instead. Nothing extra
+// is stored anywhere: the small copy only ever lives in Cloudflare's cache,
+// keyed by the object's etag so replacing a file shows the new picture.
+// Transforms are billed once per unique image per month (5 000/month free).
+const THUMB_WIDTH = 400;
+
+async function handleThumb(request, url, env, ctx) {
+  const key = url.searchParams.get("key");
+  if (!key) return new Response("Missing key", { status: 400 });
+  if (isReserved(key)) return new Response("Reserved prefix", { status: 400 });
+
+  const head = await env.DRIVE_BUCKET.head(key);
+  if (!head) return new Response("Not found", { status: 404 });
+
+  // Cache lookup happens only after the session check above, so a cached
+  // thumbnail can never be served to someone who isn't signed in.
+  const cacheUrl = new URL(request.url);
+  cacheUrl.searchParams.set("e", head.etag);
+  cacheUrl.searchParams.set("w", String(THUMB_WIDTH));
+  const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
+  const cache = caches.default;
+  const cached = await cache.match(cacheKey);
+  if (cached) return cached;
+
+  let response = null;
+  if (env.IMAGES) {
+    try {
+      const object = await env.DRIVE_BUCKET.get(key);
+      if (!object) return new Response("Not found", { status: 404 });
+      const out = await env.IMAGES.input(object.body)
+        .transform({ width: THUMB_WIDTH })
+        .output({ format: "image/webp", quality: 75 });
+      const produced = out.response();
+      response = new Response(produced.body, {
+        headers: {
+          "content-type": produced.headers.get("content-type") || "image/webp",
+          "cache-control": "public, max-age=604800",
+        },
+      });
+    } catch (err) {
+      // Unsupported input, over the 20 MB input limit, or the monthly free
+      // transform quota is used up: fall through to the original file.
+      response = null;
+    }
+  }
+
+  if (!response) {
+    const original = await env.DRIVE_BUCKET.get(key);
+    if (!original) return new Response("Not found", { status: 404 });
+    const headers = new Headers();
+    original.writeHttpMetadata(headers);
+    headers.set("cache-control", "public, max-age=3600");
+    headers.set("x-thumb", "original"); // no resize happened
+    return new Response(original.body, { headers });
+  }
+
+  if (ctx && ctx.waitUntil) ctx.waitUntil(cache.put(cacheKey, response.clone()));
+  return response;
+}
+
 async function handleMkdir(url, env) {
   const key = url.searchParams.get("key");
   if (!key) return new Response("Missing key", { status: 400 });
@@ -789,6 +856,7 @@ const HTML = String.raw`<!doctype html>
     --accent: #2563eb;
     --danger: #dc2626;
     --hover: #f3f4f6;
+    --sel: #dbe6fe;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -799,6 +867,7 @@ const HTML = String.raw`<!doctype html>
       --accent: #5b8cff;
       --danger: #f87171;
       --hover: #1e2127;
+      --sel: #23314f;
     }
   }
   * { box-sizing: border-box; }
@@ -821,7 +890,9 @@ const HTML = String.raw`<!doctype html>
   #breadcrumb { font-size: 13px; color: var(--muted); margin-top: 4px; }
   #breadcrumb span { cursor: pointer; }
   #breadcrumb span:hover { color: var(--accent); }
-  main { flex: 1; min-width: 0; padding: 24px 32px; }
+  /* The generous bottom padding / min-height is deliberate: it leaves blank
+     space below the list to start a rubber-band selection in. */
+  main { flex: 1; min-width: 0; padding: 24px 32px 140px; min-height: 70vh; }
   #dropzone {
     border: 2px dashed var(--border);
     border-radius: 10px;
@@ -850,6 +921,8 @@ const HTML = String.raw`<!doctype html>
   th.sortable { cursor: pointer; user-select: none; }
   th.sortable:hover { color: var(--accent); }
   td { padding: 8px; border-bottom: 1px solid var(--border); }
+  /* One click selects, two open — so don't let a double click highlight text. */
+  tr.row, .tile { user-select: none; -webkit-user-select: none; }
   tr.row:hover { background: var(--hover); }
   .name { cursor: pointer; overflow-wrap: anywhere; }
   .name:hover { color: var(--accent); }
@@ -923,16 +996,60 @@ const HTML = String.raw`<!doctype html>
     width: 170px;
   }
   #searchBox:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  /* Floats over the content instead of sitting in the flow: appearing must
+     never push the file list around. z-index stays below the preview overlay. */
   #selectionBar {
+    position: fixed;
+    left: 50%;
+    bottom: 24px;
+    z-index: 9;
     display: flex;
     align-items: center;
     gap: 8px;
     font-size: 13px;
-    margin-bottom: 12px;
+    padding: 8px 16px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--bg);
+    box-shadow: 0 6px 24px rgba(0, 0, 0, .18);
+    visibility: hidden;
+    opacity: 0;
+    transform: translate(-50%, 10px);
+    /* visibility is a discrete property: give it a delay on the way out and
+       none on the way in, so the bar fades rather than popping mid-transition */
+    transition: opacity .15s ease, transform .15s ease, visibility 0s linear .15s;
+  }
+  #selectionBar.show {
+    visibility: visible;
+    opacity: 1;
+    transform: translate(-50%, 0);
+    transition: opacity .15s ease, transform .15s ease, visibility 0s;
   }
   #selectionBar button { padding: 3px 10px; font-size: 12px; }
+  #selectionHint { color: var(--muted); font-size: 12px; }
   .sel { width: 26px; }
   .sel input { accent-color: var(--accent); }
+  tr.row.selected > td { background: var(--sel); }
+  tr.row.selected:hover > td { background: var(--sel); }
+  .tile.selected { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .tile.selected .tname { background: var(--sel); }
+  /* While rubber-banding, kill text selection so the drag doesn't highlight names. */
+  body.marqueeing, body.marqueeing * { user-select: none; -webkit-user-select: none; }
+  /* ...and stop the list reacting to hover: sweeping the cursor over a folder of
+     photos would otherwise lay out each tile's action buttons in turn. The drag
+     itself is tracked on document, so the list needs no pointer events. */
+  body.marqueeing #rows, body.marqueeing #grid { pointer-events: none; }
+  #marquee {
+    position: absolute;
+    z-index: 15;
+    border: 1px solid var(--accent);
+    background: rgba(37, 99, 235, .14);
+    border-radius: 2px;
+    pointer-events: none;
+    /* Own compositing layer: resizing a translucent box that sits in the page
+       layer would repaint every photo underneath it, every frame. */
+    will-change: transform;
+  }
   tr.droptarget { outline: 2px solid var(--accent); outline-offset: -2px; }
   #grid {
     display: none;
@@ -945,13 +1062,24 @@ const HTML = String.raw`<!doctype html>
     border-radius: 10px;
     overflow: hidden;
     cursor: pointer;
+    /* keeps a tile's style/layout changes from invalidating the whole grid */
+    contain: layout paint;
   }
   .tile:hover { border-color: var(--accent); }
   .tile .thumb { width: 100%; height: 110px; object-fit: cover; display: block; background: var(--hover); }
   .tile .thumbIcon { height: 110px; display: flex; align-items: center; justify-content: center; font-size: 42px; background: var(--hover); }
   .tile .tname { font-size: 12px; padding: 6px 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .tile .tilecb { position: absolute; top: 6px; left: 6px; display: none; accent-color: var(--accent); }
-  .tile:hover .tilecb, .tile .tilecb:checked { display: block; }
+  /* opacity, not display: toggling display forces a layout pass on every tile
+     the rubber band crosses, which is what made big folders crawl. */
+  .tile .tilecb {
+    position: absolute;
+    top: 6px;
+    left: 6px;
+    accent-color: var(--accent);
+    opacity: 0;
+    pointer-events: none;
+  }
+  .tile:hover .tilecb, .tile .tilecb:checked { opacity: 1; pointer-events: auto; }
   .tile .tacts { position: absolute; top: 4px; right: 4px; display: none; gap: 3px; }
   .tile:hover .tacts { display: flex; }
   .tile .tacts button {
@@ -1022,27 +1150,150 @@ const HTML = String.raw`<!doctype html>
   }
   #hoverPreview iframe { width: 100%; height: 100%; border: none; background: white; }
   #hoverPreview img { width: 100%; height: 100%; object-fit: contain; }
-  @media (max-width: 700px) {
-    #sidebar { display: none; }
+  /* Compact "⋯" menus. On a phone the four per-row action buttons and the
+     toolbar's secondary actions collapse into these rather than wrapping onto
+     three or four lines each. */
+  .menu {
+    position: fixed;
+    z-index: 14;
+    display: none;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 170px;
+    max-width: calc(100vw - 16px);
+    padding: 6px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--bg);
+    box-shadow: 0 8px 30px rgba(0, 0, 0, .28);
   }
-  @media (max-width: 600px) {
-    header { padding: 12px 16px; }
-    main { padding: 16px; }
+  .menu.open { display: flex; }
+  .menu button {
+    width: 100%;
+    margin: 0;
+    padding: 10px 12px;
+    font-size: 14px;
+    text-align: left;
+    border-color: transparent;
+  }
+  .kebab { display: none; }
+  #treeBtn { display: none; margin-right: 10px; padding: 7px 10px; font-size: 16px; line-height: 1; }
+  #moreBtn { min-width: 40px; }
+  #sidebarBackdrop {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 11;
+    background: rgba(0, 0, 0, .45);
+  }
+  .titleWrap { display: flex; align-items: center; min-width: 0; }
+  /* Touch devices, at any width: everything the desktop reveals on :hover has
+     to be permanently visible, because there is no hover to reveal it with. */
+  @media (hover: none) {
+    /* Files can't be dragged in from a phone's file system — Upload is the way. */
+    #dropzone { display: none; }
+    /* Without this the grid view is read-only on a phone: the tile checkbox is
+       transparent AND pointer-events:none, and the action buttons never show. */
+    .tile .tilecb {
+      opacity: 1;
+      pointer-events: auto;
+      width: 20px;
+      height: 20px;
+      filter: drop-shadow(0 0 2px rgba(0, 0, 0, .55));
+    }
+    .tile .tacts { display: flex; }
+    .sel input { width: 18px; height: 18px; }
+    /* No rubber-band selection on touch, so the deliberate blank space under
+       the list is just wasted screen — keep only enough for the floating bar. */
+    main { padding-bottom: 96px; min-height: 0; }
+  }
+  @media (max-width: 820px) {
+    #selectionHint { display: none; } /* keep the floating bar narrow */
+  }
+  @media (max-width: 700px) {
+    header { padding: 10px 12px; gap: 8px; }
+    header h1 { font-size: 15px; }
+    main { padding: 14px 12px 96px; }
+    .toolbar { width: 100%; gap: 6px; }
+    .toolbar > button { padding: 8px 12px; }
+    #searchBox { flex: 1 1 80px; min-width: 0; width: auto; padding: 8px 10px; }
+    #treeBtn { display: inline-flex; }
+    /* The sidebar becomes a slide-in drawer. Hiding it outright (what this
+       breakpoint used to do) left no way at all to reach the folder tree or
+       the storage figure from a phone. */
+    #sidebar {
+      display: flex;
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: min(78vw, 300px);
+      /* An explicit height, not top/bottom insets: as an out-of-flow child of a
+         flex container the drawer inherits align-self:flex-start and refuses to
+         stretch. dvh so the phone's collapsing address bar doesn't clip it. */
+      height: 100vh;
+      height: 100dvh;
+      max-height: none;
+      z-index: 12;
+      background: var(--bg);
+      box-shadow: 0 0 30px rgba(0, 0, 0, .3);
+      transform: translateX(-100%);
+      transition: transform .2s ease;
+    }
+    #sidebar.open { transform: none; }
+    #sidebarBackdrop.open { display: block; }
+    .treeRow { padding: 9px 6px; font-size: 14px; }
+    /* One "⋯" per row instead of four buttons: they took 217px of a 375px
+       screen and squeezed the file name column down to 41px. */
+    .actions button { display: none; }
+    .actions .kebab {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 34px;
+      height: 34px;
+      margin: 0;
+      padding: 0;
+      font-size: 16px;
+    }
+    .tile .tacts button { display: none; }
+    .tile .tacts .kebab {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 30px;
+      height: 30px;
+      font-size: 15px;
+    }
     .date { display: none; }
-    th, td { padding: 6px 4px; }
-    .actions button { padding: 3px 6px; font-size: 11px; margin-left: 2px; }
-    #searchBox { width: 120px; }
-    .toolbar { gap: 6px; }
+    th, td { padding: 8px 4px; }
+    .sel { width: 32px; }
+    #grid { grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 10px; }
+    #selectionBar {
+      left: 10px;
+      right: 10px;
+      bottom: 10px;
+      justify-content: center;
+      border-radius: 14px;
+      transform: translate(0, 10px);
+    }
+    #selectionBar.show { transform: none; }
+    #selectionBar button { padding: 8px 12px; font-size: 13px; }
+    #previewHeader { flex-wrap: wrap; padding: 8px 10px; }
+    #previewHeader button { padding: 8px 12px; }
+    #previewBody img, #previewBody video { max-width: 100%; max-height: 100%; }
   }
 </style>
 </head>
 <body>
 <header>
-  <div>
-    <h1>Damien's Drive</h1>
-    <div id="breadcrumb"></div>
+  <div class="titleWrap">
+    <button id="treeBtn" title="Folders" aria-label="Show folders">&#9776;</button>
+    <div>
+      <h1>Damien's Drive</h1>
+      <div id="breadcrumb"></div>
+    </div>
   </div>
-  <div class="toolbar">
+  <div class="toolbar" id="toolbar">
     <input id="searchBox" type="search" placeholder="Search files…" />
     <button id="viewToggleBtn">Grid view</button>
     <button id="newFolderBtn">New folder</button>
@@ -1058,19 +1309,24 @@ const HTML = String.raw`<!doctype html>
     <button id="logoutBtn">Log out</button>
     <input id="fileInput" type="file" multiple style="display:none" />
     <input id="folderInput" type="file" webkitdirectory multiple style="display:none" />
+    <button id="moreBtn" title="More actions" aria-label="More actions" style="display:none">&hellip;</button>
   </div>
 </header>
+<div id="sidebarBackdrop"></div>
+<div id="overflowMenu" class="menu"></div>
+<div id="itemMenu" class="menu"></div>
 <div id="layout">
   <nav id="sidebar"><div id="tree"></div><div id="usage"></div></nav>
   <main>
     <div id="dropzone">Drag files here, or click Upload</div>
     <div id="progress"></div>
     <div id="progressBarWrap"><div id="progressBarFill"></div></div>
-    <div id="selectionBar" style="display:none">
+    <div id="selectionBar">
       <span id="selectionCount"></span>
       <button id="bulkMoveBtn">Move to…</button>
       <button id="bulkDeleteBtn" class="danger">Delete</button>
       <button id="bulkClearBtn">Clear</button>
+      <span id="selectionHint">Double-click opens · Shift-click a range · Ctrl-click to add · Ctrl+A all · Esc clears</span>
     </div>
     <table id="fileTable">
       <thead><tr><th class="sel"><input type="checkbox" id="selectAll" /></th><th id="thName" class="sortable">Name</th><th id="thSize" class="size sortable">Size</th><th class="date sortable" id="dateHeader">Modified</th><th></th></tr></thead>
@@ -1099,7 +1355,16 @@ var mode = "files"; // "files" | "trash" | "search"
 var searchQuery = "";
 var previewKey = null;
 var selected = [];
-var lastFiles = [];
+var selectAnchor = null; // last item clicked, the pivot for Shift-click ranges
+var lastFiles = [];      // file keys in display order (drives preview next/prev)
+var lastItems = [];      // selectable keys in display order: folders, then files
+// Touch keeps tap-to-open: double-tap is a poor gesture, and the checkboxes
+// are the practical way to multi-select there. Decided per gesture rather than
+// per device, so a mouse still gets click-to-select on a touchscreen laptop.
+var lastPointerType = "mouse";
+document.addEventListener("pointerdown", function (e) {
+  lastPointerType = e.pointerType || "mouse";
+}, true);
 var searchTimer = null;
 var lastDragEnd = 0;
 var sortBy = "name";
@@ -1125,6 +1390,9 @@ function checkAuth(res) {
 }
 
 function setMode(m) {
+  // Cheap no-op unless the width crossed the phone breakpoint; belt and braces
+  // in case neither the resize nor the media-query event reached us.
+  syncCompactToolbar();
   mode = m;
   var files = m === "files";
   var trash = m === "trash";
@@ -1177,39 +1445,380 @@ function sortList(list, getName, getSize, getDate) {
 }
 
 // ---- Multi-select ----
+//
+// "selected" holds file keys and folder prefixes (folders keep their trailing
+// slash, which is what tells the two apart). The DOM is the mirror, never the
+// source of truth: everything that changes the selection goes through
+// setSelection() so the checkboxes, highlight and bulk-action bar stay in step.
+
+function isFolderKey(k) { return k.charAt(k.length - 1) === "/"; }
+
+function splitItems(items) {
+  var out = { folders: [], files: [] };
+  items.forEach(function (k) { (isFolderKey(k) ? out.folders : out.files).push(k); });
+  return out;
+}
+
+function selectableEls() {
+  return document.querySelectorAll("#rows tr[data-key], #grid .tile[data-key]");
+}
+
+function setSelection(keys) {
+  selected = keys;
+  syncSelectionUI();
+}
+
+function syncSelectionUI() {
+  // A lookup map, not repeated indexOf: with 200 items in the folder that was
+  // 40 000 string comparisons per frame while dragging a band.
+  var picked = Object.create(null);
+  selected.forEach(function (k) { picked[k] = true; });
+  Array.prototype.forEach.call(selectableEls(), function (el) {
+    var on = picked[el._key] === true;
+    if (el.classList.contains("selected") !== on) el.classList.toggle("selected", on);
+    // _selcb is cached by wireItem: a querySelector per row per frame is
+    // wasteful while a rubber band is being dragged.
+    var cb = el._selcb;
+    if (cb && cb.checked !== on) cb.checked = on;
+  });
+  var all = document.getElementById("selectAll");
+  if (all) {
+    all.checked = lastItems.length > 0 && selected.length === lastItems.length;
+    all.indeterminate = selected.length > 0 && selected.length < lastItems.length;
+  }
+  document.getElementById("selectionBar").classList.toggle("show", selected.length > 0);
+  document.getElementById("selectionCount").textContent = selected.length + " selected";
+}
 
 function toggleSelect(key, on) {
   var i = selected.indexOf(key);
   if (on && i === -1) selected.push(key);
   if (!on && i !== -1) selected.splice(i, 1);
-  updateSelectionBar();
+  syncSelectionUI();
 }
 
 function clearSelection() {
-  selected = [];
-  var all = document.getElementById("selectAll");
-  if (all) all.checked = false;
-  updateSelectionBar();
+  selectAnchor = null;
+  setSelection([]);
 }
 
-function updateSelectionBar() {
-  document.getElementById("selectionBar").style.display = selected.length ? "flex" : "none";
-  document.getElementById("selectionCount").textContent = selected.length + " selected";
+function selectAllItems() {
+  selectAnchor = null;
+  setSelection(lastItems.slice());
+}
+
+// Shift-click: everything between the anchor and the clicked item, in the
+// order they are currently displayed.
+function selectRange(fromKey, toKey, additive) {
+  var i = lastItems.indexOf(fromKey), j = lastItems.indexOf(toKey);
+  if (i === -1 || j === -1) { toggleSelect(toKey, true); return; }
+  if (i > j) { var t = i; i = j; j = t; }
+  var keys = additive ? selected.slice() : [];
+  for (var n = i; n <= j; n++) {
+    if (keys.indexOf(lastItems[n]) === -1) keys.push(lastItems[n]);
+  }
+  setSelection(keys);
+}
+
+// Wires one row or tile: a click selects it, a double click opens it (folders
+// navigate, files preview), Ctrl/Cmd-click toggles and Shift-click takes a
+// range. "openItem" may be null for views where nothing opens.
+function wireItem(el, key, openItem) {
+  el.dataset.key = key;
+  el._key = key; // dataset reads are slow in a per-frame loop
+  el._selcb = el.querySelector(".selcb");
+  if (selected.indexOf(key) !== -1) el.classList.add("selected");
+
+  function open() {
+    // swallow the phantom click that can follow a drag gesture
+    if (!openItem || Date.now() - lastDragEnd < 400) return;
+    openItem();
+  }
+
+  el.addEventListener("mousedown", function (e) {
+    if (e.shiftKey) e.preventDefault(); // stop the browser selecting text
+  });
+  el.addEventListener("click", function (e) {
+    // buttons and the checkbox keep their own behaviour
+    if (e.target.closest("button, input, a")) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.shiftKey && selectAnchor !== null) {
+      selectRange(selectAnchor, key, e.ctrlKey || e.metaKey);
+    } else if (e.ctrlKey || e.metaKey) {
+      toggleSelect(key, selected.indexOf(key) === -1);
+      selectAnchor = key;
+    } else if (lastPointerType === "touch") {
+      open();
+    } else {
+      // Plain click replaces the selection. Note this runs on mouseup, so
+      // dragging a multi-selection still carries the whole group.
+      setSelection([key]);
+      selectAnchor = key;
+    }
+  });
+  el.addEventListener("dblclick", function (e) {
+    if (e.target.closest("button, input, a")) return;
+    e.preventDefault();
+    open();
+  });
+}
+
+function openItemKey(key) {
+  if (isFolderKey(key)) { setMode("files"); load(key); }
+  else openPreview(key);
+}
+
+// Dragging an item that is part of the selection carries the whole selection.
+function setDragPayload(e, key) {
+  if (selected.length && selected.indexOf(key) !== -1) {
+    e.dataTransfer.setData("application/x-drive-keys", JSON.stringify(selected));
+  } else if (isFolderKey(key)) {
+    e.dataTransfer.setData("application/x-drive-dir", key);
+  } else {
+    e.dataTransfer.setData("application/x-drive-key", key);
+  }
+  e.dataTransfer.effectAllowed = "move";
+}
+
+function makeCheckbox(key) {
+  var cb = document.createElement("input");
+  cb.type = "checkbox";
+  cb.className = "selcb";
+  cb.checked = selected.indexOf(key) !== -1;
+  cb.onchange = function () { toggleSelect(key, cb.checked); selectAnchor = key; };
+  cb.onclick = function (e) { e.stopPropagation(); };
+  return cb;
 }
 
 function makeSelTd(key) {
   var td = document.createElement("td");
   td.className = "sel";
-  if (key) {
-    var cb = document.createElement("input");
-    cb.type = "checkbox";
-    cb.className = "selcb";
-    cb.checked = selected.indexOf(key) !== -1;
-    cb.onchange = function () { toggleSelect(key, cb.checked); };
-    cb.onclick = function (e) { e.stopPropagation(); };
-    td.appendChild(cb);
-  }
+  if (key) td.appendChild(makeCheckbox(key));
   return td;
+}
+
+function makeTileCb(key) {
+  var cb = makeCheckbox(key);
+  cb.className = "selcb tilecb";
+  return cb;
+}
+
+// ---- Compact layout (phones) ----
+//
+// Below 700px the toolbar's secondary actions and every row's action buttons
+// collapse into "⋯" menus, and the folder tree becomes a slide-in drawer.
+// The overflow buttons are MOVED into the menu rather than cloned, so setMode()
+// keeps driving the very same elements whichever layout is in force.
+
+var narrowMQ = window.matchMedia("(max-width: 700px)");
+var OVERFLOW_IDS = ["newFolderBtn", "uploadFolderBtn", "backupBtn", "sharesBtn",
+  "trashBtn", "restoreAllBtn", "emptyTrashBtn", "revokeAllBtn", "logoutBtn"];
+var toolbarOrder = null;
+var compactApplied = null; // which layout the toolbar is currently in
+var menuAnchor = null;
+
+function closeMenus() {
+  document.getElementById("itemMenu").classList.remove("open");
+  document.getElementById("overflowMenu").classList.remove("open");
+  menuAnchor = null;
+}
+
+// Anchors a menu under its button, pulled back inside the viewport if it would
+// run off the right edge, and flipped above the button near the bottom.
+function placeMenu(menu, anchor) {
+  menu.style.left = "0px";
+  menu.style.top = "0px";
+  var r = anchor.getBoundingClientRect();
+  var m = menu.getBoundingClientRect();
+  var left = Math.max(8, Math.min(r.right - m.width, window.innerWidth - m.width - 8));
+  var top = r.bottom + 6;
+  if (top + m.height > window.innerHeight - 8) top = Math.max(8, r.top - m.height - 6);
+  menu.style.left = Math.round(left) + "px";
+  menu.style.top = Math.round(top) + "px";
+}
+
+// Returns true if the menu ended up open. A second tap on the same button closes it.
+function toggleMenu(menu, anchor) {
+  var reopening = menu.classList.contains("open") && menuAnchor === anchor;
+  closeMenus();
+  if (reopening) return false;
+  menu.classList.add("open");
+  menuAnchor = anchor;
+  placeMenu(menu, anchor);
+  return true;
+}
+
+function openItemMenu(anchor, actions) {
+  var menu = document.getElementById("itemMenu");
+  menu.innerHTML = "";
+  actions.forEach(function (a) {
+    var b = document.createElement("button");
+    b.textContent = a.label;
+    if (a.danger) b.className = "danger";
+    b.onclick = function (e) { e.stopPropagation(); closeMenus(); a.onClick(); };
+    menu.appendChild(b);
+  });
+  toggleMenu(menu, anchor);
+}
+
+// The "⋯" that stands in for a row's or tile's action buttons on a phone.
+// Hidden by CSS on wide screens, where the buttons themselves are shown.
+function makeKebab(actions) {
+  var b = document.createElement("button");
+  b.className = "kebab";
+  b.type = "button";
+  b.textContent = "⋯";
+  b.title = "Actions";
+  b.setAttribute("aria-label", "Actions");
+  b.onclick = function (e) { e.stopPropagation(); openItemMenu(b, actions); };
+  return b;
+}
+
+// Driven by window resize (which covers a phone being rotated across the
+// breakpoint) rather than the media query's own change event, which some
+// browsers don't fire for programmatic viewport changes. Cheap to call: it
+// returns immediately unless the layout actually has to swap.
+function syncCompactToolbar() {
+  var bar = document.getElementById("toolbar");
+  var menu = document.getElementById("overflowMenu");
+  if (compactApplied === narrowMQ.matches) return;
+  compactApplied = narrowMQ.matches;
+  // Captured before anything moves, so going back to the wide layout restores
+  // the authored order exactly.
+  if (!toolbarOrder) toolbarOrder = Array.prototype.slice.call(bar.children);
+  if (narrowMQ.matches) {
+    OVERFLOW_IDS.forEach(function (id) { menu.appendChild(document.getElementById(id)); });
+  } else {
+    toolbarOrder.forEach(function (el) { bar.appendChild(el); });
+  }
+  document.getElementById("moreBtn").style.display = narrowMQ.matches ? "" : "none";
+  closeMenus();
+}
+
+function setDrawer(open) {
+  document.getElementById("sidebar").classList.toggle("open", open);
+  document.getElementById("sidebarBackdrop").classList.toggle("open", open);
+}
+
+// ---- Rubber-band selection (drag a box over empty space) ----
+
+var mq = null;
+
+function startMarquee(e) {
+  mq = {
+    x0: e.pageX, y0: e.pageY, x1: e.pageX, y1: e.pageY,
+    cy: e.clientY,
+    base: (e.ctrlKey || e.metaKey || e.shiftKey) ? selected.slice() : [],
+    el: null, timer: null, raf: 0, boxes: null
+  };
+  document.addEventListener("mousemove", onMarqueeMove);
+  document.addEventListener("mouseup", endMarquee);
+}
+
+// Rows don't move while the band is being dragged, so measure them once. Page
+// coordinates are scroll-independent, which keeps the snapshot valid while the
+// list auto-scrolls. Measuring per mousemove instead would force a full layout
+// on every event — the difference is very visible in a folder of 200 photos.
+function marqueeSnapshot() {
+  mq.boxes = Array.prototype.map.call(selectableEls(), function (el) {
+    var r = el.getBoundingClientRect();
+    return {
+      key: el._key,
+      l: r.left + window.scrollX, t: r.top + window.scrollY,
+      r: r.right + window.scrollX, b: r.bottom + window.scrollY
+    };
+  });
+}
+
+function onMarqueeMove(e) {
+  if (!mq) return;
+  mq.x1 = e.pageX;
+  mq.y1 = e.pageY;
+  mq.cy = e.clientY;
+  if (!mq.el) {
+    // a few px of slop so a plain click on empty space isn't a 0x0 drag
+    if (Math.abs(mq.x1 - mq.x0) < 5 && Math.abs(mq.y1 - mq.y0) < 5) return;
+    mq.el = document.createElement("div");
+    mq.el.id = "marquee";
+    document.body.appendChild(mq.el);
+    document.body.classList.add("marqueeing");
+    hideHoverPreview();
+    marqueeSnapshot();
+    mq.timer = setInterval(marqueeAutoScroll, 40);
+  }
+  e.preventDefault();
+  scheduleMarqueeDraw();
+}
+
+// Redraw at most once per frame, however fast the mouse reports.
+function scheduleMarqueeDraw() {
+  if (!mq || mq.raf) return;
+  mq.raf = requestAnimationFrame(function () {
+    if (!mq) return;
+    mq.raf = 0;
+    drawMarquee();
+  });
+}
+
+function drawMarquee() {
+  var l = Math.min(mq.x0, mq.x1), t = Math.min(mq.y0, mq.y1);
+  var r = Math.max(mq.x0, mq.x1), b = Math.max(mq.y0, mq.y1);
+  mq.el.style.left = l + "px";
+  mq.el.style.top = t + "px";
+  mq.el.style.width = (r - l) + "px";
+  mq.el.style.height = (b - t) + "px";
+
+  var keys = mq.base.slice();
+  var seen = Object.create(null);
+  keys.forEach(function (k) { seen[k] = true; });
+  mq.boxes.forEach(function (box) {
+    if (box.l < r && box.r > l && box.t < b && box.b > t && seen[box.key] !== true) {
+      seen[box.key] = true;
+      keys.push(box.key);
+    }
+  });
+  // Only touch the DOM when the set actually changed: dragging across empty
+  // space shouldn't rewrite 200 checkboxes every frame.
+  if (!sameKeys(keys, selected)) setSelection(keys);
+}
+
+function sameKeys(a, b) {
+  if (a.length !== b.length) return false;
+  for (var i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+// Dragging past the top/bottom edge keeps the list moving under the box.
+function marqueeAutoScroll() {
+  if (!mq || !mq.el) return;
+  var edge = 60, speed = 0;
+  if (mq.cy < edge) speed = -Math.min(28, (edge - mq.cy) / 2);
+  else if (mq.cy > window.innerHeight - edge) speed = Math.min(28, (mq.cy - (window.innerHeight - edge)) / 2);
+  if (!speed) return;
+  var before = window.scrollY;
+  window.scrollBy(0, speed);
+  var moved = window.scrollY - before;
+  if (moved) { mq.y1 += moved; scheduleMarqueeDraw(); }
+}
+
+function endMarquee(e) {
+  document.removeEventListener("mousemove", onMarqueeMove);
+  document.removeEventListener("mouseup", endMarquee);
+  if (!mq) return;
+  if (mq.raf) cancelAnimationFrame(mq.raf);
+  // Apply the final rectangle: releasing the button before the next frame
+  // would otherwise drop the last part of the drag.
+  if (mq.el) drawMarquee();
+  if (mq.el) {
+    clearInterval(mq.timer);
+    mq.el.remove();
+    document.body.classList.remove("marqueeing");
+    lastDragEnd = Date.now(); // swallow the click that follows the drag
+  } else if (!(e.ctrlKey || e.metaKey || e.shiftKey)) {
+    clearSelection(); // plain click on empty space
+  }
+  mq = null;
 }
 
 function renderBreadcrumb() {
@@ -1246,20 +1855,13 @@ function renderBreadcrumb() {
   });
 }
 
-function makeRow(nameText, icon, sizeText, dateText, onNameClick, actionButtons) {
+function makeRow(nameText, icon, sizeText, dateText, actionButtons) {
   var tr = document.createElement("tr");
   tr.className = "row";
 
   var nameTd = document.createElement("td");
   nameTd.className = "name";
   nameTd.textContent = icon + " " + nameText;
-  if (onNameClick) {
-    nameTd.onclick = function () {
-      // swallow the phantom click that can follow a drag gesture
-      if (Date.now() - lastDragEnd < 400) return;
-      onNameClick();
-    };
-  }
   tr.appendChild(nameTd);
 
   var sizeTd = document.createElement("td");
@@ -1281,6 +1883,7 @@ function makeRow(nameText, icon, sizeText, dateText, onNameClick, actionButtons)
     b.onclick = btn.onClick;
     actionsTd.appendChild(b);
   });
+  actionsTd.appendChild(makeKebab(actionButtons || []));
   tr.appendChild(actionsTd);
 
   return tr;
@@ -1370,6 +1973,8 @@ function load(prefix, fromHistory) {
         function (f) { return f.size; },
         function (f) { return f.uploaded; });
       lastFiles = data.files.map(function (f) { return f.key; });
+      // Folders render first in both layouts, so ranges follow that order.
+      lastItems = data.folders.map(function (f) { return f.prefix; }).concat(lastFiles);
       var style = folderViewStyle(prefix);
       document.getElementById("viewToggleBtn").textContent = style === "grid" ? "List view" : "Grid view";
       var table = document.getElementById("fileTable");
@@ -1398,42 +2003,33 @@ function renderListRows(data, prefix) {
     var name = folder.slice(prefix.length).replace(/\/$/, "");
     var sizeText = f.count ? humanSize(f.size) : "";
     var dateText = f.modified ? humanDate(f.modified) : "";
-    var tr = makeRow(name, "📁", sizeText, dateText, function () { load(folder); }, [
+    var tr = makeRow(name, "📁", sizeText, dateText, [
       { label: "Rename", onClick: function () { renameFolder(folder); } },
       { label: "Delete", onClick: function () { removeFolder(folder); } }
     ]);
     makeDropTarget(tr, folder);
-    tr.insertBefore(makeSelTd(null), tr.firstChild);
+    tr.insertBefore(makeSelTd(folder), tr.firstChild);
+    wireItem(tr, folder, function () { load(folder); });
     tr.draggable = true;
-    tr.addEventListener("dragstart", function (e) {
-      e.dataTransfer.setData("application/x-drive-dir", folder);
-      e.dataTransfer.effectAllowed = "move";
-    });
+    tr.addEventListener("dragstart", function (e) { setDragPayload(e, folder); });
     tr.addEventListener("dragend", function () { lastDragEnd = Date.now(); });
     rows.appendChild(tr);
   });
 
   data.files.forEach(function (file) {
     var name = file.key.slice(prefix.length);
-    var tr = makeRow(name, "📄", humanSize(file.size), humanDate(file.uploaded),
-      function () { openPreview(file.key); }, [
-        { label: "Share", onClick: function () { shareFile(file.key); } },
-        { label: "Rename", onClick: function () { renameFile(file.key); } },
-        { label: "Download", onClick: function () { download(file.key); } },
-        { label: "Delete", onClick: function () { removeFile(file.key); } }
-      ]);
+    var tr = makeRow(name, "📄", humanSize(file.size), humanDate(file.uploaded), [
+      { label: "Share", onClick: function () { shareFile(file.key); } },
+      { label: "Rename", onClick: function () { renameFile(file.key); } },
+      { label: "Download", onClick: function () { download(file.key); } },
+      { label: "Delete", onClick: function () { removeFile(file.key); } }
+    ]);
     tr.insertBefore(makeSelTd(file.key), tr.firstChild);
-    tr.dataset.key = file.key;
+    wireItem(tr, file.key, function () { openPreview(file.key); });
     tr.draggable = true;
     tr.addEventListener("dragstart", function (e) {
       hideHoverPreview();
-      if (selected.length && selected.indexOf(file.key) !== -1) {
-        // Dragging a checked row drags the whole selection.
-        e.dataTransfer.setData("application/x-drive-keys", JSON.stringify(selected));
-      } else {
-        e.dataTransfer.setData("application/x-drive-key", file.key);
-      }
-      e.dataTransfer.effectAllowed = "move";
+      setDragPayload(e, file.key);
     });
     tr.addEventListener("mouseenter", function (e) {
       clearTimeout(hoverTimer);
@@ -1467,6 +2063,10 @@ function tileActions(buttons) {
     btn.onclick = function (e) { e.stopPropagation(); b.onClick(); };
     d.appendChild(btn);
   });
+  // Same actions as a labelled list, for the phone layout.
+  d.appendChild(makeKebab(buttons.map(function (b) {
+    return { label: b.title, danger: b.danger, onClick: b.onClick };
+  })));
   return d;
 }
 
@@ -1492,16 +2092,11 @@ function renderGrid(data, prefix) {
       { icon: "rename", title: "Rename", onClick: function () { renameFolder(folder); } },
       { icon: "trash", title: "Delete", danger: true, onClick: function () { removeFolder(folder); } }
     ]));
-    tile.onclick = function () {
-      if (Date.now() - lastDragEnd < 400) return;
-      load(folder);
-    };
+    tile.appendChild(makeTileCb(folder));
+    wireItem(tile, folder, function () { load(folder); });
     makeDropTarget(tile, folder);
     tile.draggable = true;
-    tile.addEventListener("dragstart", function (e) {
-      e.dataTransfer.setData("application/x-drive-dir", folder);
-      e.dataTransfer.effectAllowed = "move";
-    });
+    tile.addEventListener("dragstart", function (e) { setDragPayload(e, folder); });
     tile.addEventListener("dragend", function () { lastDragEnd = Date.now(); });
     grid.appendChild(tile);
   });
@@ -1514,7 +2109,13 @@ function renderGrid(data, prefix) {
       var im = document.createElement("img");
       im.className = "thumb";
       im.loading = "lazy";
-      im.src = "/api/object?key=" + encodeURIComponent(file.key) + "&view=1";
+      im.decoding = "async";
+      // Resized server-side; falls back to the original if that ever fails.
+      im.src = "/api/thumb?key=" + encodeURIComponent(file.key);
+      im.onerror = function () {
+        im.onerror = null;
+        im.src = "/api/object?key=" + encodeURIComponent(file.key) + "&view=1";
+      };
       tile.appendChild(im);
     } else {
       var icon = document.createElement("div");
@@ -1528,13 +2129,7 @@ function renderGrid(data, prefix) {
     nm.title = name;
     tile.appendChild(nm);
 
-    var cb = document.createElement("input");
-    cb.type = "checkbox";
-    cb.className = "selcb tilecb";
-    cb.checked = selected.indexOf(file.key) !== -1;
-    cb.onchange = function () { toggleSelect(file.key, cb.checked); };
-    cb.onclick = function (e) { e.stopPropagation(); };
-    tile.appendChild(cb);
+    tile.appendChild(makeTileCb(file.key));
 
     tile.appendChild(tileActions([
       { icon: "share", title: "Share", onClick: function () { shareFile(file.key); } },
@@ -1543,19 +2138,11 @@ function renderGrid(data, prefix) {
       { icon: "trash", title: "Delete", danger: true, onClick: function () { removeFile(file.key); } }
     ]));
 
-    tile.onclick = function () {
-      if (Date.now() - lastDragEnd < 400) return;
-      openPreview(file.key);
-    };
+    wireItem(tile, file.key, function () { openPreview(file.key); });
     tile.draggable = true;
     tile.addEventListener("dragstart", function (e) {
       hideHoverPreview();
-      if (selected.length && selected.indexOf(file.key) !== -1) {
-        e.dataTransfer.setData("application/x-drive-keys", JSON.stringify(selected));
-      } else {
-        e.dataTransfer.setData("application/x-drive-key", file.key);
-      }
-      e.dataTransfer.effectAllowed = "move";
+      setDragPayload(e, file.key);
     });
     tile.addEventListener("dragend", function () { lastDragEnd = Date.now(); });
     grid.appendChild(tile);
@@ -1573,16 +2160,16 @@ function loadTrash() {
       rows.innerHTML = "";
 
       lastFiles = [];
+      lastItems = [];
       sortList(data.files,
         function (f) { return f.original; },
         function (f) { return f.size; },
         function (f) { return f.deleted; });
       data.files.forEach(function (file) {
-        var tr = makeRow(file.original, "🗑️", humanSize(file.size), humanDate(file.deleted),
-          null, [
-            { label: "Restore", onClick: function () { restoreFile(file.key); } },
-            { label: "Delete forever", danger: true, onClick: function () { purgeFile(file.key); } }
-          ]);
+        var tr = makeRow(file.original, "🗑️", humanSize(file.size), humanDate(file.deleted), [
+          { label: "Restore", onClick: function () { restoreFile(file.key); } },
+          { label: "Delete forever", danger: true, onClick: function () { purgeFile(file.key); } }
+        ]);
         tr.insertBefore(makeSelTd(null), tr.firstChild);
         rows.appendChild(tr);
       });
@@ -1610,10 +2197,11 @@ function loadShares() {
       var rows = document.getElementById("rows");
       rows.innerHTML = "";
       lastFiles = [];
+      lastItems = [];
       var now = Math.floor(Date.now() / 1000);
       data.shares.forEach(function (s) {
         var expText = s.exp ? new Date(s.exp * 1000).toLocaleString() : "?";
-        var tr = makeRow(s.key, "🔗", s.exp < now ? "expired" : "active", expText, null, [
+        var tr = makeRow(s.key, "🔗", s.exp < now ? "expired" : "active", expText, [
           { label: "Copy link", onClick: function () {
               if (navigator.clipboard && navigator.clipboard.writeText) {
                 navigator.clipboard.writeText(s.url);
@@ -1667,6 +2255,7 @@ function positionHover(el, x, y) {
 }
 
 function showHoverPreview(key, x, y) {
+  if (mq && mq.el) return; // not while a rubber band is being dragged
   var ext = extOf(key);
   var url = "/api/object?key=" + encodeURIComponent(key) + "&view=1";
   var imgs = ["png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "ico"];
@@ -1674,7 +2263,8 @@ function showHoverPreview(key, x, y) {
   var node = null;
   if (imgs.indexOf(ext) !== -1) {
     node = document.createElement("img");
-    node.src = url;
+    // The popup is 320px wide, so the resized copy is plenty and loads instantly.
+    node.src = "/api/thumb?key=" + encodeURIComponent(key);
   } else if (ext === "pdf") {
     node = document.createElement("iframe");
     node.src = url + "#toolbar=0&navpanes=0&scrollbar=0&view=FitH";
@@ -1887,35 +2477,84 @@ function renameFile(key) {
   }
 }
 
-function moveKeys(keys, destPrefix) {
-  if (!keys.length) return;
-  var failed = 0, done = 0;
-  setProgress("Moving: 0/" + keys.length, 0, keys.length);
-  Promise.all(keys.map(function (k) {
-    var to = destPrefix + k.split("/").pop();
-    if (to === k) {
-      done++;
-      return Promise.resolve();
+// Moves any mix of files and folders into destPrefix. Folders are expanded to
+// the keys underneath them (markers included) so everything travels as one job
+// with a single progress bar.
+function moveItems(items, destPrefix) {
+  items = items.filter(Boolean);
+  if (!items.length) return;
+
+  var nested = items.filter(function (k) {
+    return isFolderKey(k) && folderTarget(k, destPrefix).indexOf(k) === 0;
+  });
+  if (nested.length) { alert("Cannot move a folder inside itself."); return; }
+
+  setProgress("Preparing…", 0, 1);
+  Promise.all(items.map(function (k) {
+    if (!isFolderKey(k)) {
+      return Promise.resolve([{ from: k, to: destPrefix + k.split("/").pop() }]);
     }
-    return fetchRetry("/api/rename?from=" + encodeURIComponent(k) + "&to=" + encodeURIComponent(to), { method: "POST" })
+    var to = folderTarget(k, destPrefix);
+    return fetch("/api/keys?prefix=" + encodeURIComponent(k))
       .then(checkAuth)
-      .then(function (res) { if (!res.ok) failed++; })
-      .catch(function () { failed++; })
-      .then(function () {
-        done++;
-        setProgress("Moving: " + done + "/" + keys.length, done, keys.length);
+      .then(function (res) { return res.json(); })
+      .then(function (data) {
+        return data.keys.map(function (sub) { return { from: sub, to: to + sub.slice(k.length) }; });
       });
-  })).then(function () {
-    hideProgress();
-    if (failed) alert(failed + " file(s) could not be moved (same name already there?).");
-    clearSelection();
-    refresh();
+  })).then(function (groups) {
+    var pairs = [];
+    groups.forEach(function (g) {
+      g.forEach(function (p) { if (p.from !== p.to) pairs.push(p); });
+    });
+    runMoves(pairs);
   });
 }
 
-function moveFile(key, destPrefix) {
-  if (!key) return;
-  moveKeys([key], destPrefix);
+function folderTarget(prefix, destPrefix) {
+  return destPrefix + prefix.replace(/\/$/, "").split("/").pop() + "/";
+}
+
+// Renames pairs three at a time so a big folder doesn't fire hundreds of
+// requests at once.
+function runMoves(pairs, label) {
+  var what = label ? "Moving " + label : "Moving";
+  if (!pairs.length) {
+    hideProgress();
+    clearSelection();
+    initTree();
+    refresh();
+    return;
+  }
+  var idx = 0, active = 0, done = 0, failed = 0;
+  setProgress(what + ": 0/" + pairs.length, 0, pairs.length);
+  function pump() {
+    while (active < 3 && idx < pairs.length) {
+      (function (p) {
+        active++;
+        fetchRetry("/api/rename?from=" + encodeURIComponent(p.from) + "&to=" + encodeURIComponent(p.to), { method: "POST" })
+          .then(checkAuth)
+          .then(function (res) { if (!res.ok) failed++; })
+          .catch(function () { failed++; })
+          .then(function () {
+            active--;
+            done++;
+            setProgress(what + ": " + done + "/" + pairs.length, done, pairs.length);
+            if (done === pairs.length) {
+              hideProgress();
+              if (failed) alert(failed + " item(s) could not be moved (name conflicts) and stayed in place.");
+              clearSelection();
+              initTree();
+              refreshUsage();
+              refresh();
+            } else {
+              pump();
+            }
+          });
+      })(pairs[idx]);
+      idx++;
+    }
+  }
+  pump();
 }
 
 function loadSearch() {
@@ -1934,27 +2573,21 @@ function loadSearch() {
         function (f) { return f.size; },
         function (f) { return f.uploaded; });
       lastFiles = data.files.map(function (f) { return f.key; });
+      lastItems = lastFiles.slice();
 
       data.files.forEach(function (file) {
-        var tr = makeRow(file.key, "📄", humanSize(file.size), humanDate(file.uploaded),
-          function () { openPreview(file.key); }, [
-            { label: "Share", onClick: function () { shareFile(file.key); } },
-            { label: "Rename", onClick: function () { renameFile(file.key); } },
-            { label: "Download", onClick: function () { download(file.key); } },
-            { label: "Delete", onClick: function () { removeFile(file.key); } }
-          ]);
+        var tr = makeRow(file.key, "📄", humanSize(file.size), humanDate(file.uploaded), [
+          { label: "Share", onClick: function () { shareFile(file.key); } },
+          { label: "Rename", onClick: function () { renameFile(file.key); } },
+          { label: "Download", onClick: function () { download(file.key); } },
+          { label: "Delete", onClick: function () { removeFile(file.key); } }
+        ]);
         tr.insertBefore(makeSelTd(file.key), tr.firstChild);
-        tr.dataset.key = file.key;
+        wireItem(tr, file.key, function () { openPreview(file.key); });
         tr.draggable = true;
         tr.addEventListener("dragstart", function (e) {
           hideHoverPreview();
-          if (selected.length && selected.indexOf(file.key) !== -1) {
-            // Dragging a checked row drags the whole selection.
-            e.dataTransfer.setData("application/x-drive-keys", JSON.stringify(selected));
-          } else {
-            e.dataTransfer.setData("application/x-drive-key", file.key);
-          }
-          e.dataTransfer.effectAllowed = "move";
+          setDragPayload(e, file.key);
         });
         tr.addEventListener("mouseenter", function (e) {
           clearTimeout(hoverTimer);
@@ -2143,54 +2776,19 @@ function dragKind(e) {
   return null;
 }
 
-// Moves every object under srcPrefix to destPrefix key-by-key so the progress
-// bar can track it; a few transfers run in parallel.
+// Renaming a folder = moving every object under it to the new prefix. (Moving
+// a folder into another folder goes through moveItems instead, which keeps the
+// folder's own name.)
 function movePrefixWithProgress(srcPrefix, destPrefix, label) {
+  setProgress("Preparing…", 0, 1);
   fetch("/api/keys?prefix=" + encodeURIComponent(srcPrefix))
     .then(checkAuth)
     .then(function (res) { return res.json(); })
     .then(function (data) {
-      var keys = data.keys;
-      if (!keys.length) { initTree(); refresh(); return; }
-      var idx = 0, active = 0, done = 0, failed = 0;
-      setProgress("Moving " + label + ": 0/" + keys.length, 0, keys.length);
-      function pump() {
-        while (active < 3 && idx < keys.length) {
-          (function (k) {
-            active++;
-            var target = destPrefix + k.slice(srcPrefix.length);
-            fetchRetry("/api/rename?from=" + encodeURIComponent(k) + "&to=" + encodeURIComponent(target), { method: "POST" })
-              .then(checkAuth)
-              .then(function (res) { if (!res.ok) failed++; })
-              .catch(function () { failed++; })
-              .then(function () {
-                active--;
-                done++;
-                setProgress("Moving " + label + ": " + done + "/" + keys.length, done, keys.length);
-                if (done === keys.length) {
-                  hideProgress();
-                  if (failed) alert(failed + " item(s) could not be moved (name conflicts) and stayed in place.");
-                  initTree();
-                  refresh();
-                } else {
-                  pump();
-                }
-              });
-          })(keys[idx]);
-          idx++;
-        }
-      }
-      pump();
+      runMoves(data.keys.map(function (k) {
+        return { from: k, to: destPrefix + k.slice(srcPrefix.length) };
+      }), label);
     });
-}
-
-function moveDir(srcPrefix, destPrefix) {
-  if (!srcPrefix) return;
-  var name = srcPrefix.replace(/\/$/, "").split("/").pop();
-  var to = destPrefix + name + "/";
-  if (to === srcPrefix) return;
-  if (to.indexOf(srcPrefix) === 0) { alert("Cannot move a folder inside itself."); return; }
-  movePrefixWithProgress(srcPrefix, to, name);
 }
 
 function makeDropTarget(el, destPrefix) {
@@ -2208,11 +2806,11 @@ function makeDropTarget(el, destPrefix) {
     e.stopPropagation();
     el.classList.remove("droptarget");
     if (kind === "files") {
-      moveKeys(JSON.parse(e.dataTransfer.getData("application/x-drive-keys")), destPrefix);
+      moveItems(JSON.parse(e.dataTransfer.getData("application/x-drive-keys")), destPrefix);
     } else if (kind === "file") {
-      moveFile(e.dataTransfer.getData("application/x-drive-key"), destPrefix);
+      moveItems([e.dataTransfer.getData("application/x-drive-key")], destPrefix);
     } else {
-      moveDir(e.dataTransfer.getData("application/x-drive-dir"), destPrefix);
+      moveItems([e.dataTransfer.getData("application/x-drive-dir")], destPrefix);
     }
   });
 }
@@ -2261,7 +2859,7 @@ function treeNode(prefix, name, depth) {
       });
   };
 
-  row.onclick = function () { setMode("files"); load(prefix); };
+  row.onclick = function () { setDrawer(false); setMode("files"); load(prefix); };
   makeDropTarget(row, prefix);
 
   wrap.appendChild(row);
@@ -2514,9 +3112,25 @@ document.getElementById("previewOverlay").addEventListener("click", function (e)
   if (e.target === document.getElementById("previewBody")) closePreview();
 });
 document.addEventListener("keydown", function (e) {
-  if (e.key === "Escape") closePreview();
-  else if (previewKey && e.key === "ArrowLeft") stepPreview(-1);
-  else if (previewKey && e.key === "ArrowRight") stepPreview(1);
+  if (previewKey && e.key === "ArrowLeft") { stepPreview(-1); return; }
+  if (previewKey && e.key === "ArrowRight") { stepPreview(1); return; }
+  if (e.key === "Escape") {
+    if (menuAnchor) closeMenus();
+    else if (previewKey) closePreview();
+    else if (document.getElementById("sidebar").classList.contains("open")) setDrawer(false);
+    else if (selected.length) clearSelection();
+    return;
+  }
+  var t = e.target;
+  if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+  if ((e.ctrlKey || e.metaKey) && (e.key === "a" || e.key === "A") && !previewKey) {
+    if (!lastItems.length) return;
+    e.preventDefault();
+    selectAllItems();
+  } else if (e.key === "Enter" && !previewKey && selected.length === 1) {
+    e.preventDefault();
+    openItemKey(selected[0]);
+  }
 });
 document.getElementById("previewPrevBtn").onclick = function () { stepPreview(-1); };
 document.getElementById("previewNextBtn").onclick = function () { stepPreview(1); };
@@ -2540,17 +3154,24 @@ document.getElementById("searchBox").oninput = function () {
 };
 
 document.getElementById("selectAll").onchange = function () {
-  var on = this.checked;
-  lastFiles.forEach(function (k) { toggleSelect(k, on); });
-  var cbs = document.querySelectorAll(".selcb");
-  Array.prototype.forEach.call(cbs, function (c) { c.checked = on; });
+  if (this.checked) selectAllItems(); else clearSelection();
 };
 
-document.getElementById("bulkClearBtn").onclick = function () {
-  clearSelection();
-  var cbs = document.querySelectorAll(".selcb");
-  Array.prototype.forEach.call(cbs, function (c) { c.checked = false; });
-};
+document.getElementById("bulkClearBtn").onclick = clearSelection;
+
+// Rubber-band: only starts on empty space, so it never fights the row/tile
+// drag-and-drop that moves files into folders.
+document.querySelector("main").addEventListener("mousedown", function (e) {
+  if (e.button !== 0) return;
+  // Touch fires compatibility mouse events after a tap; a rubber band there
+  // would only fight the page's own scrolling.
+  if (lastPointerType === "touch") return;
+  if (mode === "trash" || mode === "shares") return;
+  if (document.getElementById("previewOverlay").style.display !== "none") return;
+  if (e.target.closest("tr, .tile, button, input, textarea, select, a, #dropzone, #selectionBar")) return;
+  e.preventDefault();
+  startMarquee(e);
+});
 
 document.getElementById("backupBtn").onclick = function () {
   fetch("/api/usage")
@@ -2570,10 +3191,20 @@ document.getElementById("viewToggleBtn").onclick = function () {
 
 document.getElementById("bulkDeleteBtn").onclick = function () {
   if (!selected.length) return;
-  if (!confirm("Move " + selected.length + " file(s) to the trash?")) return;
-  Promise.all(selected.map(function (k) {
+  var s = splitItems(selected);
+  var what = [];
+  if (s.files.length) what.push(s.files.length + " file(s)");
+  if (s.folders.length) what.push(s.folders.length + " folder(s) and everything inside");
+  if (!confirm("Move " + what.join(" and ") + " to the trash?")) return;
+  var jobs = s.files.map(function (k) {
     return fetch("/api/object?key=" + encodeURIComponent(k), { method: "DELETE" });
-  })).then(function () { clearSelection(); refreshUsage(); refresh(); });
+  }).concat(s.folders.map(function (p) { return deleteFolderContents(p); }));
+  Promise.all(jobs).then(function () {
+    clearSelection();
+    initTree();
+    refreshUsage();
+    refresh();
+  });
 };
 
 document.getElementById("bulkMoveBtn").onclick = function () {
@@ -2582,11 +3213,37 @@ document.getElementById("bulkMoveBtn").onclick = function () {
   if (dest === null) return;
   dest = dest.trim();
   if (dest && dest.charAt(dest.length - 1) !== "/") dest += "/";
-  moveKeys(selected.slice(), dest);
+  moveItems(selected.slice(), dest);
 };
+
+document.getElementById("treeBtn").onclick = function (e) {
+  e.stopPropagation();
+  setDrawer(!document.getElementById("sidebar").classList.contains("open"));
+};
+document.getElementById("sidebarBackdrop").onclick = function () { setDrawer(false); };
+
+document.getElementById("moreBtn").onclick = function (e) {
+  e.stopPropagation();
+  toggleMenu(document.getElementById("overflowMenu"), this);
+};
+document.getElementById("overflowMenu").addEventListener("click", function (e) {
+  if (e.target.closest("button")) closeMenus();
+});
+
+document.addEventListener("click", function (e) {
+  if (menuAnchor && !e.target.closest(".menu, .kebab, #moreBtn")) closeMenus();
+});
+// A menu is positioned in viewport coordinates, so it has to go when the page
+// moves underneath it.
+window.addEventListener("scroll", closeMenus, true);
+window.addEventListener("resize", function () { closeMenus(); syncCompactToolbar(); });
+window.addEventListener("orientationchange", syncCompactToolbar);
+if (narrowMQ.addEventListener) narrowMQ.addEventListener("change", syncCompactToolbar);
+else if (narrowMQ.addListener) narrowMQ.addListener(syncCompactToolbar); // Safari < 14
 
 window.addEventListener("popstate", applyHash);
 
+syncCompactToolbar();
 setMode("files");
 initTree();
 applyHash();
