@@ -747,6 +747,9 @@ const LOGIN_HTML = String.raw`<!doctype html>
     }
   }
   * { box-sizing: border-box; }
+  /* iOS Safari inflates font sizes in some blocks unless told not to, which
+     grows buttons past the width they were laid out for. */
+  html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
   body {
     margin: 0;
     min-height: 100vh;
@@ -871,6 +874,9 @@ const HTML = String.raw`<!doctype html>
     }
   }
   * { box-sizing: border-box; }
+  /* iOS Safari inflates font sizes in some blocks unless told not to, which
+     grows buttons past the width they were laid out for. */
+  html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
   body {
     margin: 0;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -1211,13 +1217,25 @@ const HTML = String.raw`<!doctype html>
     #selectionHint { display: none; } /* keep the floating bar narrow */
   }
   @media (max-width: 700px) {
+    /* A single element wider than the screen makes iOS Safari widen the whole
+       layout viewport, and then everything else — grid, table, header — is
+       laid out against that wider page and pans off the right edge. So on a
+       phone nothing is allowed to overflow: the guard below is the backstop,
+       and the rules after it are what keep it from being needed. */
+    html, body { overflow-x: hidden; }
     header { padding: 10px 12px; gap: 8px; }
     header h1 { font-size: 15px; }
     main { padding: 14px 12px 96px; }
-    .toolbar { width: 100%; gap: 6px; }
-    .toolbar > button { padding: 8px 12px; }
-    #searchBox { flex: 1 1 80px; min-width: 0; width: auto; padding: 8px 10px; }
-    #treeBtn { display: inline-flex; }
+    /* One row that provably fits at 320px: only the search box flexes, and the
+       button labels shorten (see syncCompactToolbar). Wrapping is off because
+       a wrapped toolbar was what overflowed in the first place. */
+    .toolbar { width: 100%; gap: 6px; flex-wrap: nowrap; }
+    .toolbar > button { flex: 0 0 auto; padding: 8px 10px; white-space: nowrap; }
+    #searchBox { flex: 1 1 60px; min-width: 0; width: auto; padding: 8px 10px; }
+    .titleWrap { flex: 1 1 auto; }
+    .titleWrap > div { min-width: 0; }
+    #breadcrumb { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #treeBtn { display: inline-flex; flex-shrink: 0; }
     /* The sidebar becomes a slide-in drawer. Hiding it outright (what this
        breakpoint used to do) left no way at all to reach the folder tree or
        the storage figure from a phone. */
@@ -1266,7 +1284,13 @@ const HTML = String.raw`<!doctype html>
     }
     .date { display: none; }
     th, td { padding: 8px 4px; }
-    .sel { width: 32px; }
+    /* Fixed columns from the header row. With auto layout a long unbroken
+       filename widens the table past the screen no matter how the name cell
+       wraps, which is exactly the overflow that dragged the page sideways. */
+    table { table-layout: fixed; }
+    .sel { width: 34px; }
+    .size { width: 74px; }
+    .actions { width: 46px; }
     #grid { grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 10px; }
     #selectionBar {
       left: 10px;
@@ -1329,7 +1353,7 @@ const HTML = String.raw`<!doctype html>
       <span id="selectionHint">Double-click opens · Shift-click a range · Ctrl-click to add · Ctrl+A all · Esc clears</span>
     </div>
     <table id="fileTable">
-      <thead><tr><th class="sel"><input type="checkbox" id="selectAll" /></th><th id="thName" class="sortable">Name</th><th id="thSize" class="size sortable">Size</th><th class="date sortable" id="dateHeader">Modified</th><th></th></tr></thead>
+      <thead><tr><th class="sel"><input type="checkbox" id="selectAll" /></th><th id="thName" class="sortable">Name</th><th id="thSize" class="size sortable">Size</th><th class="date sortable" id="dateHeader">Modified</th><th class="actions"></th></tr></thead>
       <tbody id="rows"></tbody>
     </table>
     <div id="grid"></div>
@@ -1693,7 +1717,17 @@ function syncCompactToolbar() {
     toolbarOrder.forEach(function (el) { bar.appendChild(el); });
   }
   document.getElementById("moreBtn").style.display = narrowMQ.matches ? "" : "none";
+  // Short labels on a phone: "Upload files" and "Grid view" together overflow
+  // the one toolbar row that has to hold them.
+  document.getElementById("uploadBtn").textContent = narrowMQ.matches ? "Upload" : "Upload files";
+  document.getElementById("backBtn").textContent = narrowMQ.matches ? "← Back" : "← Back to files";
+  document.getElementById("viewToggleBtn").textContent = viewToggleLabel(folderViewStyle(currentPrefix));
   closeMenus();
+}
+
+function viewToggleLabel(style) {
+  if (narrowMQ.matches) return style === "grid" ? "List" : "Grid";
+  return style === "grid" ? "List view" : "Grid view";
 }
 
 function setDrawer(open) {
@@ -1976,7 +2010,7 @@ function load(prefix, fromHistory) {
       // Folders render first in both layouts, so ranges follow that order.
       lastItems = data.folders.map(function (f) { return f.prefix; }).concat(lastFiles);
       var style = folderViewStyle(prefix);
-      document.getElementById("viewToggleBtn").textContent = style === "grid" ? "List view" : "Grid view";
+      document.getElementById("viewToggleBtn").textContent = viewToggleLabel(style);
       var table = document.getElementById("fileTable");
       var grid = document.getElementById("grid");
       document.getElementById("rows").innerHTML = "";
