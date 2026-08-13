@@ -523,7 +523,17 @@ async function handleRename(url, env) {
 // is stored anywhere: the small copy only ever lives in Cloudflare's cache,
 // keyed by the object's etag so replacing a file shows the new picture.
 // Transforms are billed once per unique image per month (5 000/month free).
+// Videos go through the Media binding instead, which grabs a still frame; it
+// reads the R2 body directly, so nothing about the bucket has to be public.
 const THUMB_WIDTH = 400;
+// A second in, because the first frame of a phone video is often black or
+// still focusing.
+const FRAME_TIME = "1s";
+const VIDEO_EXTS = ["mp4", "webm", "mov", "m4v"];
+
+function isVideoKey(key) {
+  return VIDEO_EXTS.indexOf(key.split(".").pop().toLowerCase()) !== -1;
+}
 
 async function handleThumb(request, url, env, ctx) {
   const key = url.searchParams.get("key");
@@ -532,6 +542,8 @@ async function handleThumb(request, url, env, ctx) {
 
   const head = await env.DRIVE_BUCKET.head(key);
   if (!head) return new Response("Not found", { status: 404 });
+
+  const video = isVideoKey(key);
 
   // Cache lookup happens only after the session check above, so a cached
   // thumbnail can never be served to someone who isn't signed in.
@@ -544,7 +556,9 @@ async function handleThumb(request, url, env, ctx) {
   if (cached) return cached;
 
   let response = null;
-  if (env.IMAGES) {
+  if (video) {
+    response = await videoFrame(env, key);
+  } else if (env.IMAGES) {
     try {
       const object = await env.DRIVE_BUCKET.get(key);
       if (!object) return new Response("Not found", { status: 404 });
@@ -566,6 +580,10 @@ async function handleThumb(request, url, env, ctx) {
   }
 
   if (!response) {
+    // For a photo, handing back the original is a fine (if heavy) thumbnail.
+    // For a video it would be megabytes of MP4 in an <img>, so say so instead
+    // and let the grid keep its icon.
+    if (video) return new Response("No frame", { status: 415 });
     const original = await env.DRIVE_BUCKET.get(key);
     if (!original) return new Response("Not found", { status: 404 });
     const headers = new Headers();
@@ -577,6 +595,35 @@ async function handleThumb(request, url, env, ctx) {
 
   if (ctx && ctx.waitUntil) ctx.waitUntil(cache.put(cacheKey, response.clone()));
   return response;
+}
+
+// Pulls a still out of a video. A clip shorter than FRAME_TIME has no frame
+// there, so a failure retries at the very start before giving up. The body has
+// to be re-fetched per attempt: a Media input can't be reused across
+// transformations. Returns null when no frame can be made at all — an
+// unsupported codec, or over the binding's 100 MB input limit.
+async function videoFrame(env, key) {
+  if (!env.MEDIA) return null;
+  for (const time of [FRAME_TIME, "0s"]) {
+    try {
+      const object = await env.DRIVE_BUCKET.get(key);
+      if (!object) return null;
+      const out = await env.MEDIA.input(object.body)
+        .transform({ width: THUMB_WIDTH })
+        .output({ mode: "frame", time, format: "jpg" })
+        .response();
+      if (!out || !out.ok) continue;
+      return new Response(out.body, {
+        headers: {
+          "content-type": out.headers.get("content-type") || "image/jpeg",
+          "cache-control": "public, max-age=604800",
+        },
+      });
+    } catch (err) {
+      // try the start, then fall through
+    }
+  }
+  return null;
 }
 
 async function handleMkdir(url, env) {
@@ -1075,6 +1122,25 @@ const HTML = String.raw`<!doctype html>
   .tile .thumb { width: 100%; height: 110px; object-fit: cover; display: block; background: var(--hover); }
   .tile .thumbIcon { height: 110px; display: flex; align-items: center; justify-content: center; font-size: 42px; background: var(--hover); }
   .tile .tname { font-size: 12px; padding: 6px 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  /* A video's thumbnail is just a frame out of it, so without this badge a
+     video tile is indistinguishable from a photo. Centred on the 110px thumb. */
+  .tile .playBadge {
+    position: absolute;
+    top: 55px;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 34px;
+    height: 34px;
+    padding-left: 3px; /* optical centring: the glyph's mass sits left */
+    border-radius: 50%;
+    background: rgba(0, 0, 0, .55);
+    color: #fff;
+    font-size: 13px;
+    pointer-events: none;
+  }
   /* opacity, not display: toggling display forces a layout pass on every tile
      the rubber band crosses, which is what made big folders crawl. */
   .tile .tilecb {
@@ -1393,6 +1459,8 @@ var searchTimer = null;
 var lastDragEnd = 0;
 var sortBy = "name";
 var sortDir = 1;
+// Both the grid (thumbnail via a still frame) and the preview need this list.
+var VIDEO_EXTS = ["mp4", "webm", "mov", "m4v"];
 
 function humanSize(bytes) {
   if (bytes === 0) return "0 B";
@@ -2104,6 +2172,13 @@ function tileActions(buttons) {
   return d;
 }
 
+function fileIcon(emoji) {
+  var d = document.createElement("div");
+  d.className = "thumbIcon";
+  d.textContent = emoji;
+  return d;
+}
+
 function renderGrid(data, prefix) {
   var grid = document.getElementById("grid");
   var imgExts = ["png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "ico"];
@@ -2113,10 +2188,7 @@ function renderGrid(data, prefix) {
     var name = folder.slice(prefix.length).replace(/\/$/, "");
     var tile = document.createElement("div");
     tile.className = "tile";
-    var icon = document.createElement("div");
-    icon.className = "thumbIcon";
-    icon.textContent = "📁";
-    tile.appendChild(icon);
+    tile.appendChild(fileIcon("📁"));
     var nm = document.createElement("div");
     nm.className = "tname";
     nm.textContent = name;
@@ -2139,23 +2211,38 @@ function renderGrid(data, prefix) {
     var name = file.key.slice(prefix.length);
     var tile = document.createElement("div");
     tile.className = "tile";
-    if (imgExts.indexOf(extOf(file.key)) !== -1) {
+    var ext = extOf(file.key);
+    var isVid = VIDEO_EXTS.indexOf(ext) !== -1;
+    if (imgExts.indexOf(ext) !== -1 || isVid) {
       var im = document.createElement("img");
       im.className = "thumb";
       im.loading = "lazy";
       im.decoding = "async";
-      // Resized server-side; falls back to the original if that ever fails.
+      // Resized (photos) or a still frame (videos), both server-side.
       im.src = "/api/thumb?key=" + encodeURIComponent(file.key);
+      // A frame on its own looks exactly like a photo, so mark it as playable.
+      var badge = null;
+      if (isVid) {
+        badge = document.createElement("div");
+        badge.className = "playBadge";
+        badge.textContent = "▶";
+      }
       im.onerror = function () {
         im.onerror = null;
-        im.src = "/api/object?key=" + encodeURIComponent(file.key) + "&view=1";
+        if (isVid) {
+          // No frame could be produced — unsupported codec, or too large. The
+          // original is a whole video, so an icon is all that's left, and 🎬
+          // already says "video" without the badge on top of it.
+          tile.replaceChild(fileIcon("🎬"), im);
+          badge.remove();
+        } else {
+          im.src = "/api/object?key=" + encodeURIComponent(file.key) + "&view=1";
+        }
       };
       tile.appendChild(im);
+      if (badge) tile.appendChild(badge);
     } else {
-      var icon = document.createElement("div");
-      icon.className = "thumbIcon";
-      icon.textContent = "📄";
-      tile.appendChild(icon);
+      tile.appendChild(fileIcon("📄"));
     }
     var nm = document.createElement("div");
     nm.className = "tname";
@@ -2381,7 +2468,7 @@ function openPreview(key) {
   var texts = ["txt", "md", "csv", "json", "js", "css", "html", "htm", "xml", "svg", "log", "yml", "yaml", "ini", "py", "sh"];
   var office = ["doc", "docx", "xls", "xlsx", "ppt", "pptx"];
   var audios = ["mp3", "wav", "m4a", "ogg", "flac"];
-  var videos = ["mp4", "webm", "mov", "m4v"];
+  var videos = VIDEO_EXTS;
 
   if (images.indexOf(ext) !== -1) {
     var img = document.createElement("img");

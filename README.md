@@ -28,6 +28,14 @@ Because a touchscreen has no hover, the tile checkboxes and action buttons that
 appear on hover elsewhere are shown permanently there, and the drag-and-drop
 zone (useless from a phone) is hidden.
 
+Grid view shows real thumbnails rather than icons. Photos are resized through
+the Images binding; videos get a still frame pulled a second in via the Media
+binding, marked with a ▶ badge. Both read the R2 bytes directly, so the bucket
+stays private, and neither stores anything — the small copies live only in
+Cloudflare's cache, keyed by the object's etag. A video the Media binding can't
+read (an unsupported codec, or over its 100 MB input limit) falls back to a 🎬
+icon.
+
 Previews open in-page: PDFs, images, text, audio and video render directly in
 the browser. Word/Excel/PowerPoint files render through Microsoft's embedded
 Office viewer, which fetches the document via a short-lived (5 min) signed link

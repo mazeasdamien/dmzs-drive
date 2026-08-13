@@ -23,6 +23,11 @@
   "images": {
     "binding": "IMAGES"
   },
+  // Grabs a still frame out of a video for the same grid tiles. Reads the R2
+  // bytes directly, so the bucket stays private — no public URL involved.
+  "media": {
+    "binding": "MEDIA"
+  },
   "vars": {
     // Basic-auth username. Not secret, fine to keep here.
     "AUTH_USER": "damien"
