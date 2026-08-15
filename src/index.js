@@ -1413,6 +1413,7 @@ const HTML = String.raw`<!doctype html>
     <div id="progressBarWrap"><div id="progressBarFill"></div></div>
     <div id="selectionBar">
       <span id="selectionCount"></span>
+      <button id="bulkDownloadBtn">Download</button>
       <button id="bulkMoveBtn">Move to…</button>
       <button id="bulkDeleteBtn" class="danger">Delete</button>
       <button id="bulkClearBtn">Clear</button>
@@ -1448,6 +1449,7 @@ var selected = [];
 var selectAnchor = null; // last item clicked, the pivot for Shift-click ranges
 var lastFiles = [];      // file keys in display order (drives preview next/prev)
 var lastItems = [];      // selectable keys in display order: folders, then files
+var fileMeta = {};       // key -> {size, uploaded} for the listing on screen, for zip stamps
 // Touch keeps tap-to-open: double-tap is a poor gesture, and the checkboxes
 // are the practical way to multi-select there. Decided per gesture rather than
 // per device, so a mouse still gets click-to-select on a touchscreen laptop.
@@ -2096,6 +2098,8 @@ function load(prefix, fromHistory) {
         function (f) { return f.size; },
         function (f) { return f.uploaded; });
       lastFiles = data.files.map(function (f) { return f.key; });
+      fileMeta = {};
+      data.files.forEach(function (f) { fileMeta[f.key] = { size: f.size, uploaded: f.uploaded }; });
       // Folders render first in both layouts, so ranges follow that order.
       lastItems = data.folders.map(function (f) { return f.prefix; }).concat(lastFiles);
       var style = folderViewStyle(prefix);
@@ -2819,94 +2823,143 @@ function listAllFiles(prefix) {
     });
 }
 
+// Backup and "Download selected" both land here: files are fetched one at a
+// time and appended to a stored (uncompressed) ZIP assembled in the browser, so
+// the Worker never holds an archive in memory. stripPrefix trims a leading
+// folder off the entry names, which keeps a selection's zip flat instead of
+// burying it under the folder it came from.
+function zipFiles(files, zipName, label, stripPrefix) {
+  var enc = new TextEncoder();
+  var parts = [];
+  var central = [];
+  var offset = 0;
+  var i = 0;
+
+  function next() {
+    if (i >= files.length) { finish(); return; }
+    var f = files[i];
+    setProgress(label + " " + (i + 1) + "/" + files.length + ": " + f.key, i, files.length);
+    fetchRetry("/api/object?key=" + encodeURIComponent(f.key))
+      .then(checkAuth)
+      .then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.arrayBuffer();
+      })
+      .then(function (buf) {
+        var data = new Uint8Array(buf);
+        var name = f.key;
+        if (stripPrefix && name.indexOf(stripPrefix) === 0) name = name.slice(stripPrefix.length);
+        var nameBytes = enc.encode(name);
+        var crc = crc32(data);
+        // A search or trash selection may carry no upload stamp; dosDateTime
+        // already falls back to now for an invalid date.
+        var dt = dosDateTime(new Date(f.uploaded));
+        var lh = new DataView(new ArrayBuffer(30));
+        lh.setUint32(0, 0x04034b50, true);
+        lh.setUint16(4, 20, true);
+        lh.setUint16(6, 0x0800, true); // UTF-8 file names
+        lh.setUint16(8, 0, true);      // stored, no compression
+        lh.setUint16(10, dt.time, true);
+        lh.setUint16(12, dt.date, true);
+        lh.setUint32(14, crc, true);
+        lh.setUint32(18, data.length, true);
+        lh.setUint32(22, data.length, true);
+        lh.setUint16(26, nameBytes.length, true);
+        lh.setUint16(28, 0, true);
+        parts.push(new Uint8Array(lh.buffer), nameBytes, data);
+        central.push({ name: nameBytes, crc: crc, size: data.length, time: dt.time, date: dt.date, offset: offset });
+        offset += 30 + nameBytes.length + data.length;
+        i++;
+        next();
+      })
+      .catch(function () {
+        hideProgress();
+        alert(label + " aborted: could not download " + f.key + ". Try again.");
+      });
+  }
+
+  function finish() {
+    var cdStart = offset;
+    central.forEach(function (c) {
+      var ch = new DataView(new ArrayBuffer(46));
+      ch.setUint32(0, 0x02014b50, true);
+      ch.setUint16(4, 20, true);
+      ch.setUint16(6, 20, true);
+      ch.setUint16(8, 0x0800, true);
+      ch.setUint16(10, 0, true);
+      ch.setUint16(12, c.time, true);
+      ch.setUint16(14, c.date, true);
+      ch.setUint32(16, c.crc, true);
+      ch.setUint32(20, c.size, true);
+      ch.setUint32(24, c.size, true);
+      ch.setUint16(28, c.name.length, true);
+      ch.setUint32(42, c.offset, true);
+      parts.push(new Uint8Array(ch.buffer), c.name);
+      offset += 46 + c.name.length;
+    });
+    var eocd = new DataView(new ArrayBuffer(22));
+    eocd.setUint32(0, 0x06054b50, true);
+    eocd.setUint16(8, central.length, true);
+    eocd.setUint16(10, central.length, true);
+    eocd.setUint32(12, offset - cdStart, true);
+    eocd.setUint32(16, cdStart, true);
+    parts.push(new Uint8Array(eocd.buffer));
+
+    var blob = new Blob(parts, { type: "application/zip" });
+    var a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = zipName;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 10000);
+    hideProgress();
+  }
+
+  next();
+}
+
 function backupDrive() {
   setProgress("Preparing backup…", 0, 1);
   listAllFiles("").then(function (files) {
     if (!files.length) { hideProgress(); alert("Nothing to back up."); return; }
-    var enc = new TextEncoder();
-    var parts = [];
-    var central = [];
-    var offset = 0;
-    var i = 0;
-
-    function next() {
-      if (i >= files.length) { finish(); return; }
-      var f = files[i];
-      setProgress("Backing up " + (i + 1) + "/" + files.length + ": " + f.key, i, files.length);
-      fetchRetry("/api/object?key=" + encodeURIComponent(f.key))
-        .then(checkAuth)
-        .then(function (r) {
-          if (!r.ok) throw new Error("HTTP " + r.status);
-          return r.arrayBuffer();
-        })
-        .then(function (buf) {
-          var data = new Uint8Array(buf);
-          var nameBytes = enc.encode(f.key);
-          var crc = crc32(data);
-          var dt = dosDateTime(new Date(f.uploaded));
-          var lh = new DataView(new ArrayBuffer(30));
-          lh.setUint32(0, 0x04034b50, true);
-          lh.setUint16(4, 20, true);
-          lh.setUint16(6, 0x0800, true); // UTF-8 file names
-          lh.setUint16(8, 0, true);      // stored, no compression
-          lh.setUint16(10, dt.time, true);
-          lh.setUint16(12, dt.date, true);
-          lh.setUint32(14, crc, true);
-          lh.setUint32(18, data.length, true);
-          lh.setUint32(22, data.length, true);
-          lh.setUint16(26, nameBytes.length, true);
-          lh.setUint16(28, 0, true);
-          parts.push(new Uint8Array(lh.buffer), nameBytes, data);
-          central.push({ name: nameBytes, crc: crc, size: data.length, time: dt.time, date: dt.date, offset: offset });
-          offset += 30 + nameBytes.length + data.length;
-          i++;
-          next();
-        })
-        .catch(function () {
-          hideProgress();
-          alert("Backup aborted: could not download " + f.key + ". Try again.");
-        });
-    }
-
-    function finish() {
-      var cdStart = offset;
-      central.forEach(function (c) {
-        var ch = new DataView(new ArrayBuffer(46));
-        ch.setUint32(0, 0x02014b50, true);
-        ch.setUint16(4, 20, true);
-        ch.setUint16(6, 20, true);
-        ch.setUint16(8, 0x0800, true);
-        ch.setUint16(10, 0, true);
-        ch.setUint16(12, c.time, true);
-        ch.setUint16(14, c.date, true);
-        ch.setUint32(16, c.crc, true);
-        ch.setUint32(20, c.size, true);
-        ch.setUint32(24, c.size, true);
-        ch.setUint16(28, c.name.length, true);
-        ch.setUint32(42, c.offset, true);
-        parts.push(new Uint8Array(ch.buffer), c.name);
-        offset += 46 + c.name.length;
-      });
-      var eocd = new DataView(new ArrayBuffer(22));
-      eocd.setUint32(0, 0x06054b50, true);
-      eocd.setUint16(8, central.length, true);
-      eocd.setUint16(10, central.length, true);
-      eocd.setUint32(12, offset - cdStart, true);
-      eocd.setUint32(16, cdStart, true);
-      parts.push(new Uint8Array(eocd.buffer));
-
-      var blob = new Blob(parts, { type: "application/zip" });
-      var a = document.createElement("a");
-      a.href = URL.createObjectURL(blob);
-      a.download = "drive-backup-" + new Date().toISOString().slice(0, 10) + ".zip";
-      document.body.appendChild(a);
-      a.click();
-      setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 10000);
-      hideProgress();
-    }
-
-    next();
+    zipFiles(files, "drive-backup-" + todayStamp() + ".zip", "Backing up", "");
   });
+}
+
+// "Download" on a selection. One file comes down as itself; anything else is
+// zipped. Selected folders are expanded first so their contents keep their
+// shape inside the archive, and entry names are relative to the folder on
+// screen — grabbing ten photos out of Transfer/ gives you ten photos, not
+// ten photos nested under Transfer/.
+function downloadSelected() {
+  if (!selected.length) return;
+  var picked = splitItems(selected);
+  if (!picked.folders.length && picked.files.length === 1) { download(picked.files[0]); return; }
+
+  setProgress("Preparing download…", 0, 1);
+  var loose = picked.files.map(function (k) {
+    var m = fileMeta[k] || {};
+    return { key: k, size: m.size, uploaded: m.uploaded };
+  });
+  Promise.all(picked.folders.map(function (p) { return listAllFiles(p); })).then(function (nested) {
+    var files = loose.slice();
+    nested.forEach(function (n) { files = files.concat(n); });
+    if (!files.length) { hideProgress(); alert("Nothing to download — the selected folder is empty."); return; }
+    if (files.length === 1) { hideProgress(); download(files[0].key); return; }
+    // The whole archive is assembled as one Blob, so a huge selection is worth
+    // a warning before the tab tries to hold it all at once.
+    var bytes = files.reduce(function (n, f) { return n + (f.size || 0); }, 0);
+    if (bytes > 512 * 1024 * 1024 &&
+        !confirm("Zip " + files.length + " files (" + humanSize(bytes) + ")? The archive is built in the browser, so it has to fit in memory.")) {
+      hideProgress();
+      return;
+    }
+    zipFiles(files, "drive-selection-" + todayStamp() + ".zip", "Zipping", currentPrefix);
+  });
+}
+
+function todayStamp() {
+  return new Date().toISOString().slice(0, 10);
 }
 
 function dragKind(e) {
@@ -3298,6 +3351,7 @@ document.getElementById("selectAll").onchange = function () {
   if (this.checked) selectAllItems(); else clearSelection();
 };
 
+document.getElementById("bulkDownloadBtn").onclick = downloadSelected;
 document.getElementById("bulkClearBtn").onclick = clearSelection;
 
 // Rubber-band: only starts on empty space, so it never fights the row/tile
