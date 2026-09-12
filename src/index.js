@@ -1279,6 +1279,38 @@ const HTML = String.raw`<!doctype html>
        the list is just wasted screen — keep only enough for the floating bar. */
     main { padding-bottom: 96px; min-height: 0; }
   }
+  /* Four action buttons need ~280px of the row, and in a table that width can
+     only come out of the name column: around 1000px it was down to a couple of
+     characters and every file name came out broken one letter per line. Below
+     this the row folds them into the same "⋯" menu the phone layout uses. */
+  @media (max-width: 1100px) {
+    .actions button { display: none; }
+    .actions .kebab {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 34px;
+      height: 34px;
+      margin: 0;
+      padding: 0;
+      font-size: 16px;
+    }
+  }
+  /* And the name itself stays on one line, cut with an ellipsis, instead of
+     wrapping mid-word. max-width:0 is what lets the cell shrink below its text
+     (auto table layout otherwise sizes the column to the longest name);
+     width:100% then hands it every pixel the other columns don't take. The
+     phone layout keeps wrapping: no hover there to reveal the full name, and
+     its rows can afford the height. */
+  @media (min-width: 701px) {
+    .name {
+      width: 100%;
+      max-width: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+  }
   @media (max-width: 820px) {
     #selectionHint { display: none; } /* keep the floating bar narrow */
   }
@@ -1326,19 +1358,8 @@ const HTML = String.raw`<!doctype html>
     #sidebar.open { transform: none; }
     #sidebarBackdrop.open { display: block; }
     .treeRow { padding: 9px 6px; font-size: 14px; }
-    /* One "⋯" per row instead of four buttons: they took 217px of a 375px
-       screen and squeezed the file name column down to 41px. */
-    .actions button { display: none; }
-    .actions .kebab {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      width: 34px;
-      height: 34px;
-      margin: 0;
-      padding: 0;
-      font-size: 16px;
-    }
+    /* Row actions already collapsed into the "⋯" menu at 1100px; here the
+       tiles do the same. */
     .tile .tacts button { display: none; }
     .tile .tacts .kebab {
       display: inline-flex;
@@ -1777,8 +1798,9 @@ function openItemMenu(anchor, actions) {
   toggleMenu(menu, anchor);
 }
 
-// The "⋯" that stands in for a row's or tile's action buttons on a phone.
-// Hidden by CSS on wide screens, where the buttons themselves are shown.
+// The "⋯" that stands in for a row's or tile's action buttons when the
+// window is too narrow to carry them: rows swap below 1100px, tiles below 700px.
+// Wider than that, CSS hides it and shows the buttons themselves.
 function makeKebab(actions) {
   var b = document.createElement("button");
   b.className = "kebab";
@@ -1987,6 +2009,7 @@ function makeRow(nameText, icon, sizeText, dateText, actionButtons) {
   var nameTd = document.createElement("td");
   nameTd.className = "name";
   nameTd.textContent = icon + " " + nameText;
+  nameTd.title = nameText; // the cell truncates on one line, so hover shows it whole
   tr.appendChild(nameTd);
 
   var sizeTd = document.createElement("td");
