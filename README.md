@@ -83,7 +83,7 @@ from an authenticator app (Microsoft/Google Authenticator, etc.).
 To enroll the authenticator: generate a random base32 string (A–Z, 2–7; e.g.
 32 chars), store it as `TOTP_SECRET`, and add it to your authenticator app —
 either by typing it in manually or via a QR code encoding
-`otpauth://totp/dmzs-drive:damien?secret=<TOTP_SECRET>&issuer=dmzs-drive`.
+`otpauth://totp/dmzs-drive:<your-name>?secret=<TOTP_SECRET>&issuer=dmzs-drive`.
 
 That's it — no build step, no database, no separate frontend hosting.
 
@@ -97,9 +97,24 @@ Routes → Add a custom domain.
 
 Every request is checked for a signed session cookie; sessions are created by
 `POST /api/login` with the password **and** a valid TOTP code, and last 30 days.
-Failed logins are slowed down (~800 ms) to blunt brute-forcing. Changing either
-secret invalidates all outstanding sessions. If you ever want to go further,
-Cloudflare Access (Zero Trust) can still be layered in front without code changes.
+
+Login attempts are rate limited to 8 a minute per IP (the `LOGIN_LIMIT` binding
+in `wrangler.jsonc`), checked before the password is, and a failed attempt is
+then slowed by ~800 ms afterwards. Those counters are per Cloudflare location
+and deliberately permissive, so this is a brake rather than an exact quota:
+someone hammering one connection is cut off after a handful of tries (measured:
+six 401s, then 429), while guesses spread thin across locations are only slowed
+by the delay. For a hard zone-wide cap, add a WAF rate-limiting rule on
+`/api/login` in the dashboard — one is included on the free plan. Changing
+either secret invalidates all outstanding sessions.
+
+This repository is public, and nothing in it helps anyone in: the session
+cookie is an HMAC keyed on `AUTH_PASS` + `TOTP_SECRET`, share links are HMACs
+bound to one file and an expiry, and both secrets live only in Cloudflare
+(`wrangler secret put`), never in the source. The R2 bucket has no public URL,
+so its name is of no use without R2 API credentials. If you want more than
+this, Cloudflare Access (Zero Trust) can be layered in front without code
+changes.
 
 ### Trash
 

@@ -183,6 +183,16 @@ function pngResponse(b64) {
 // ---------- Auth ----------
 
 async function handleLogin(request, env) {
+  // Checked before the credentials are, so whoever is guessing gets a handful
+  // of tries a minute per IP however fast they can send them — the 800 ms
+  // delay below only slows one request down, not a thousand in parallel. The
+  // binding is absent in local dev, where that delay is the only brake.
+  if (env.LOGIN_LIMIT) {
+    const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+    const { success } = await env.LOGIN_LIMIT.limit({ key: "login:" + ip });
+    if (!success) return new Response("Too many attempts", { status: 429 });
+  }
+
   let body = {};
   try {
     body = await request.json();
@@ -875,7 +885,9 @@ document.getElementById("loginForm").onsubmit = function (e) {
   }).then(function (res) {
     if (res.ok) { window.location.reload(); return; }
     btn.disabled = false;
-    err.textContent = "Wrong password or code. Try again.";
+    err.textContent = res.status === 429
+      ? "Too many attempts. Wait a minute and try again."
+      : "Wrong password or code. Try again.";
     document.getElementById("code").value = "";
   }).catch(function () {
     btn.disabled = false;
@@ -2063,7 +2075,7 @@ function showEmpty(count, message) {
 // Folder navigation is mirrored into the URL hash so the browser's
 // back/forward buttons walk the folder levels, and reloads keep the place.
 // The whole ancestor chain is pushed each time, so Back always goes UP one
-// level (Rennes -> France -> Home) even after jumping straight to a deep
+// level (Photos/2024 -> Photos -> Home) even after jumping straight to a deep
 // folder from the tree.
 function pushPrefixHash(prefix) {
   var chain = [""];

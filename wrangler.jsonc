@@ -28,11 +28,19 @@
   "media": {
     "binding": "MEDIA"
   },
-  "vars": {
-    // Basic-auth username. Not secret, fine to keep here.
-    "AUTH_USER": "damien"
-  }
-  // AUTH_PASS is a SECRET, not a var — set it with:
+  // Blunts brute-forcing of the login: the Worker checks this before it checks
+  // the password, so an attacker gets a handful of guesses a minute per IP
+  // rather than as many as the network allows. Counted per Cloudflare
+  // location, which is enough for that job.
+  "ratelimits": [
+    {
+      "name": "LOGIN_LIMIT",
+      "namespace_id": "1001",
+      "simple": { "limit": 8, "period": 60 }
+    }
+  ]
+  // AUTH_PASS and TOTP_SECRET are SECRETS, not vars — set them with:
   //   npx wrangler secret put AUTH_PASS
-  // (never commit a password into this file)
+  //   npx wrangler secret put TOTP_SECRET
+  // (never commit either into this file)
 }
