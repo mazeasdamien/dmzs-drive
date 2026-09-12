@@ -3144,9 +3144,64 @@ function hideProgress() {
   document.getElementById("progressBarFill").style.width = "0%";
 }
 
+// fetch() never says how much of a request body has gone out, so an upload
+// could only ever move the bar between files — drop one big file in and it sat
+// at 0% for the whole transfer, then jumped to done. XHR does report it.
+// Resolves with the HTTP status; rejects only if the request never landed.
+function putWithProgress(url, file, onProgress) {
+  return new Promise(function (resolve, reject) {
+    var xhr = new XMLHttpRequest();
+    xhr.open("PUT", url);
+    xhr.setRequestHeader("content-type", file.type || "application/octet-stream");
+    xhr.upload.onprogress = function (e) {
+      if (e.lengthComputable) onProgress(e.loaded);
+    };
+    xhr.onload = function () {
+      if (xhr.status === 401) { // session expired — the reload checkAuth does
+        window.location.reload();
+        var err = new Error("session expired");
+        err.fatal = true;
+        reject(err);
+        return;
+      }
+      resolve(xhr.status);
+    };
+    xhr.onerror = function () { reject(new Error("network")); };
+    xhr.send(file);
+  });
+}
+
+// Same retry rule as fetchRetry: three tries, for network errors and 5xx only.
+function putRetry(url, file, onProgress, tries) {
+  tries = tries === undefined ? 3 : tries;
+  return putWithProgress(url, file, onProgress).then(function (status) {
+    if (status >= 500 && tries > 1) throw new Error("server " + status);
+    return status;
+  }).catch(function (err) {
+    if (err.fatal || tries <= 1) throw err;
+    onProgress(0); // a retry re-sends the file from the start
+    return new Promise(function (r) { setTimeout(r, 800); }).then(function () {
+      return putRetry(url, file, onProgress, tries - 1);
+    });
+  });
+}
+
 function uploadItems(items) {
   var i = 0;
   var failed = [];
+  // The bar counts bytes, not files: with a single file the file counter never
+  // moves, so the bar stayed at 0% for the whole upload — the one case where
+  // it mattered most.
+  var totalBytes = items.reduce(function (n, it) { return n + (it.file.size || 0); }, 0);
+  var doneBytes = 0;
+
+  function show(it, sent) {
+    var label = "Uploading " + (i + 1) + "/" + items.length + ": " + it.relPath;
+    if (!totalBytes) { setProgress(label, i, items.length); return; }
+    setProgress(label + " — " + humanSize(doneBytes + sent) + " / " + humanSize(totalBytes),
+      doneBytes + sent, totalBytes);
+  }
+
   function next() {
     if (i >= items.length) {
       hideProgress();
@@ -3160,15 +3215,12 @@ function uploadItems(items) {
       return;
     }
     var it = items[i];
-    setProgress("Uploading " + (i + 1) + "/" + items.length + ": " + it.relPath, i, items.length);
-    fetchRetry("/api/object?key=" + encodeURIComponent(currentPrefix + it.relPath), {
-      method: "PUT",
-      headers: { "content-type": it.file.type || "application/octet-stream" },
-      body: it.file,
-    }).then(checkAuth)
-      .then(function (res) { if (!res.ok) failed.push(it.relPath); })
-      .catch(function () { failed.push(it.relPath); })
-      .then(function () { i++; next(); });
+    show(it, 0);
+    putRetry("/api/object?key=" + encodeURIComponent(currentPrefix + it.relPath), it.file,
+      function (sent) { show(it, sent); })
+      .then(function (status) { if (status < 200 || status >= 300) failed.push(it.relPath); })
+      .catch(function (err) { if (!err.fatal) failed.push(it.relPath); })
+      .then(function () { doneBytes += it.file.size || 0; i++; next(); });
   }
   next();
 }
