@@ -20,13 +20,22 @@ folder moves the whole selection.
 On phones and tablets a single tap still opens, since double-tap is an awkward
 gesture there; use the checkboxes to select several items.
 
-Below 700px the layout goes compact: the folder tree slides in from a **☰**
-button, the toolbar keeps only search, the view toggle and Upload while the rest
-of the actions move into a **⋯** menu, and each row or tile carries its own **⋯**
-instead of four buttons — which is what leaves the file name room to be read.
-Because a touchscreen has no hover, the tile checkboxes and action buttons that
-appear on hover elsewhere are shown permanently there, and the drag-and-drop
-zone (useless from a phone) is hidden.
+A file name too long for its column is cut with an ellipsis and shown whole on
+hover, rather than wrapped — a narrow column used to break a name one letter
+per line and turn every row into a tall stack of characters. Phones wrap
+instead, since there is no hover there to reveal the full name.
+
+The four action buttons on a row need about 280px, and in a table that width
+can only come out of the name column, so below 1100px each row folds them into
+a **⋯** menu carrying the same actions.
+
+Below 700px the layout goes fully compact: the folder tree slides in from a
+**☰** button, the toolbar keeps only search, the view toggle and Upload while
+the rest of the actions move into a **⋯** menu, and the grid tiles fold their
+own buttons away the same way the rows already have. Because a touchscreen has
+no hover, the tile checkboxes and action buttons that appear on hover elsewhere
+are shown permanently there, and the drag-and-drop zone (useless from a phone)
+is hidden.
 
 Grid view shows real thumbnails rather than icons. Photos are resized through
 the Images binding; videos get a still frame pulled a second in via the Media
@@ -42,11 +51,19 @@ a real thumbnail. They lean on the icon to say what they are instead — 📕 PD
 rather than every one of them being the same sheet of paper. Grid and list use
 the same icons.
 
-Previews open in-page: PDFs, images, text, audio and video render directly in
-the browser. Word/Excel/PowerPoint files render through Microsoft's embedded
-Office viewer, which fetches the document via a short-lived (5 min) signed link
-— i.e. those documents transit through Microsoft's viewer service when (and
-only when) you preview them.
+Previews open in-page: PDFs, images, audio and video render directly in the
+browser. Text files are drawn by the page itself instead of being framed,
+because a browser renders a plain-text document in the colour scheme of the
+page embedding it — which in this dark UI came out as white text on the
+frame's white background, i.e. a preview that looked empty. Rendering it here
+also means the file is only ever inserted as text, so the HTML and SVG the
+Worker downgrades to `text/plain` stay inert; past 2 MB the preview is cut off
+with a pointer to Download.
+
+Word/Excel/PowerPoint files render through Microsoft's embedded Office viewer,
+which fetches the document via a short-lived (5 min) signed link — i.e. those
+documents transit through Microsoft's viewer service when (and only when) you
+preview them.
 
 ## 1. Deploy it
 
