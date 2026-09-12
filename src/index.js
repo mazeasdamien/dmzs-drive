@@ -1204,6 +1204,19 @@ const HTML = String.raw`<!doctype html>
     overflow: auto;
   }
   #previewBody iframe { width: 100%; height: 100%; border: none; background: white; }
+  /* Text files are rendered here rather than framed: see textPreviewNode. */
+  .textPreview {
+    margin: 0;
+    padding: 16px 20px;
+    background: var(--bg);
+    color: var(--fg);
+    font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    overflow: auto;
+    box-sizing: border-box;
+  }
+  #previewBody .textPreview { align-self: stretch; flex: 1; width: 100%; }
   #previewBody img { max-width: 95%; max-height: 95%; object-fit: contain; }
   #previewBody video { max-width: 95%; max-height: 95%; }
   .noPreview { color: #eee; text-align: center; padding: 24px; }
@@ -1221,6 +1234,7 @@ const HTML = String.raw`<!doctype html>
     display: none;
   }
   #hoverPreview iframe { width: 100%; height: 100%; border: none; background: white; }
+  #hoverPreview .textPreview { width: 100%; height: 100%; padding: 10px 12px; font-size: 11px; }
   #hoverPreview img { width: 100%; height: 100%; object-fit: contain; }
   /* Compact "⋯" menus. On a phone the four per-row action buttons and the
      toolbar's secondary actions collapse into these rather than wrapping onto
@@ -1480,6 +1494,9 @@ document.addEventListener("pointerdown", function (e) {
 }, true);
 var searchTimer = null;
 var lastDragEnd = 0;
+// Past this many characters a text preview is cut off: the whole point is a
+// quick look, and pouring a huge log into one <pre> locks up the tab.
+var TEXT_PREVIEW_MAX = 2000000;
 var sortBy = "name";
 var sortDir = 1;
 // Both the grid (thumbnail via a still frame) and the preview need these.
@@ -2437,8 +2454,7 @@ function showHoverPreview(key, x, y) {
     node = document.createElement("iframe");
     node.src = url + "#toolbar=0&navpanes=0&scrollbar=0&view=FitH";
   } else if (texts.indexOf(ext) !== -1) {
-    node = document.createElement("iframe");
-    node.src = url;
+    node = textPreviewNode(url);
   }
   if (!node) return; // other types: no hover preview, click opens the full one
   var el = document.getElementById("hoverPreview");
@@ -2456,6 +2472,33 @@ function hideHoverPreview() {
 }
 
 // ---- In-page preview ----
+
+// Chrome renders a text/plain document using the colour scheme of the page
+// that embeds it, so inside this dark UI the browser's own text viewer drew
+// white text — on the iframe's white background, which is why a .txt preview
+// came out looking blank. Fetching the text and rendering it here is the only
+// way to control both colours.
+function textPreviewNode(url) {
+  var pre = document.createElement("pre");
+  pre.className = "textPreview";
+  pre.textContent = "Loading…";
+  fetch(url)
+    .then(checkAuth)
+    .then(function (res) { return res.text(); })
+    .then(function (text) {
+      if (!pre.isConnected) return; // preview was closed, or moved to another file
+      // A multi-megabyte log would otherwise freeze the tab laying it out.
+      if (text.length > TEXT_PREVIEW_MAX) {
+        text = text.slice(0, TEXT_PREVIEW_MAX) +
+          "\n\n… truncated — use Download to get the whole file.";
+      }
+      pre.textContent = text;
+    })
+    .catch(function () {
+      if (pre.isConnected) pre.textContent = "Could not load this file.";
+    });
+  return pre;
+}
 
 function extOf(key) {
   var name = key.split("/").pop();
@@ -2521,11 +2564,13 @@ function openPreview(key) {
     var img = document.createElement("img");
     img.src = inlineUrl;
     body.appendChild(img);
-  } else if (ext === "pdf" || texts.indexOf(ext) !== -1) {
+  } else if (ext === "pdf") {
     var frame = document.createElement("iframe");
     frame.src = inlineUrl;
     escFrame(frame);
     body.appendChild(frame);
+  } else if (texts.indexOf(ext) !== -1) {
+    body.appendChild(textPreviewNode(inlineUrl));
   } else if (audios.indexOf(ext) !== -1) {
     var au = document.createElement("audio");
     au.controls = true;
@@ -2572,11 +2617,13 @@ function openPreview(key) {
           var img2 = document.createElement("img");
           img2.src = inlineUrl;
           body.appendChild(img2);
-        } else if (ct === "application/pdf" || ct.indexOf("text/") === 0) {
+        } else if (ct === "application/pdf") {
           var frame2 = document.createElement("iframe");
           frame2.src = inlineUrl;
           escFrame(frame2);
           body.appendChild(frame2);
+        } else if (ct.indexOf("text/") === 0) {
+          body.appendChild(textPreviewNode(inlineUrl));
         } else if (ct.indexOf("audio/") === 0) {
           var au2 = document.createElement("audio");
           au2.controls = true;
