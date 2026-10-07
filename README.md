@@ -189,6 +189,15 @@ comes to roughly $0.05–0.08 a question with Claude Sonnet 5.5 (about twice
 that with Claude Opus 5.5). A monthly spend limit can be set at
 console.anthropic.com under Settings → Limits.
 
+The panel keeps count: a strip under its title shows what the answers have
+cost so far this month and how many questions that was, and each answer shows
+its own cost and token counts. Both are worked out from the token counts the
+API reports and the per-model prices in `CHAT_PRICES` (src/index.js), so they
+match the Anthropic bill to within rounding; update that table if prices
+change. Monthly totals live in `.config/chat-usage/` in the bucket, so every
+device sees the same figure. An answer stopped halfway is billed but not
+counted.
+
 ## 2. Syncing a folder from your PC
 
 The web UI is for browsing/uploading by hand. For an actual folder that stays in

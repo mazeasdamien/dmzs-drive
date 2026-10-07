@@ -19,6 +19,7 @@
 //   DELETE /api/trash/object?key=.trash/x -> delete permanently
 //   POST /api/trash/empty                 -> permanently delete the whole trash
 //   POST /api/chat {messages}             -> answer from the indexed documents (NDJSON stream)
+//   GET  /api/chat/usage                  -> this month's chat cost: {month, questions, cost, ...}
 //   *    everything else                  -> the UI (login page when signed out)
 //
 // A daily cron (see wrangler.jsonc "triggers") purges trash entries older
@@ -127,6 +128,9 @@ export default {
       }
       if (url.pathname === "/api/chat" && request.method === "POST") {
         return await handleChat(request, env, ctx);
+      }
+      if (url.pathname === "/api/chat/usage" && request.method === "GET") {
+        return await handleChatUsage(env);
       }
       if (url.pathname === "/api/trash/list" && request.method === "GET") {
         return await handleTrashList(env);
@@ -715,6 +719,7 @@ async function handleUsage(env) {
 //   {"t":"text","i":n,"v":"..."}                answer text for content block n
 //   {"t":"cite","i":n,"key","title","text"}     a passage block n draws on
 //   {"t":"error","v":"..."}
+//   {"t":"usage","input","output","cost","month":{...}}   what this answer cost
 //   {"t":"done"}
 // Citations are keyed by block rather than by position in the text because
 // the API may deliver a block's citation before or after its text.
@@ -841,6 +846,70 @@ async function answerChat(env, history, send, isGone) {
   }
   const final = await stream.finalMessage();
   if (final.stop_reason === "refusal") send({ t: "error", v: "Claude declined to answer this question." });
+  const u = final.usage || {};
+  const cost = chatCost(final.model, u);
+  const month = await addChatUsage(env, u, cost);
+  send({ t: "usage", input: chatInputTokens(u), output: u.output_tokens || 0, cost, month });
+}
+
+// ---------- Chat cost counter ----------
+//
+// What the answers cost on the Anthropic key, worked out from the token counts
+// each response reports, priced per million tokens. Only Claude is counted:
+// the AI Search side stays within its monthly free allowance at this volume.
+// Totals are kept per calendar month (UTC) in the hidden .config/ area, so
+// they follow the user from one device to the next.
+
+const CHAT_PRICES = {
+  // $ per million tokens: input, output, cache read, cache write
+  "claude-sonnet-5-5": [2, 10, 0.2, 2.5],
+  "claude-sonnet-5": [2, 10, 0.2, 2.5],
+  "claude-opus-5-5": [4, 20, 0.2, 5],
+  "claude-opus-5": [5, 25, 0.5, 6.25],
+  "claude-opus-4-8": [5, 25, 0.5, 6.25],
+};
+const CHAT_USAGE = CONFIG + "chat-usage/";
+
+function chatInputTokens(u) {
+  return (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
+}
+
+function chatCost(model, u) {
+  // A fallback answer reports the model that served it; anything unlisted is
+  // priced as the default model rather than silently counted as free.
+  const p = CHAT_PRICES[model] || CHAT_PRICES[CHAT_MODEL];
+  return ((u.input_tokens || 0) * p[0] + (u.output_tokens || 0) * p[1]
+    + (u.cache_read_input_tokens || 0) * p[2] + (u.cache_creation_input_tokens || 0) * p[3]) / 1e6;
+}
+
+function chatMonthKey() {
+  return CHAT_USAGE + new Date().toISOString().slice(0, 7) + ".json";
+}
+
+async function readChatUsage(env) {
+  const obj = await env.DRIVE_BUCKET.get(chatMonthKey());
+  const month = new Date().toISOString().slice(0, 7);
+  if (!obj) return { month, questions: 0, input_tokens: 0, output_tokens: 0, cost: 0 };
+  return { month, ...(await obj.json()) };
+}
+
+// Read-modify-write without a lock: one person asking one question at a time
+// is the only writer, so a lost update would need two answers finishing in
+// the same instant.
+async function addChatUsage(env, u, cost) {
+  const t = await readChatUsage(env);
+  t.questions += 1;
+  t.input_tokens += chatInputTokens(u);
+  t.output_tokens += u.output_tokens || 0;
+  t.cost += cost;
+  await env.DRIVE_BUCKET.put(chatMonthKey(), JSON.stringify(t), {
+    httpMetadata: { contentType: "application/json" },
+  });
+  return t;
+}
+
+async function handleChatUsage(env) {
+  return Response.json(await readChatUsage(env));
 }
 
 // Smaller blocks give Claude finer citation boundaries: it cites whole blocks,
@@ -1629,6 +1698,32 @@ const HTML = String.raw`<!doctype html>
     border-bottom: 1px solid var(--border);
   }
   #chatTitle { font-size: 15px; font-weight: 600; }
+  /* The running cost sits right under the title, on its own tinted strip, so
+     it is read every time the panel opens rather than hunted for. */
+  #chatUsageBar {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 8px 16px;
+    background: var(--sel);
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+  }
+  #chatUsageCost { display: inline-block; font-size: 16px; color: var(--accent); font-variant-numeric: tabular-nums; }
+  #chatUsageCount { color: var(--muted); margin-left: auto; }
+  #chatUsageBar.bump #chatUsageCost { animation: chatBump .6s ease-out; }
+  @keyframes chatBump { 0% { transform: scale(1.25); } 100% { transform: none; } }
+  .chatCost {
+    display: inline-block;
+    margin-top: 8px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: var(--hover);
+    color: var(--muted);
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+  }
+  .chatCost strong { color: var(--fg); }
   #chatScope { font-size: 12px; color: var(--muted); margin-top: 2px; }
   .chatActions { display: flex; gap: 6px; flex-shrink: 0; }
   #chatLog {
@@ -1802,6 +1897,9 @@ const HTML = String.raw`<!doctype html>
       <button id="chatNewBtn" title="Start a new conversation">New chat</button>
       <button id="chatCloseBtn" title="Close (Esc)" aria-label="Close">&times;</button>
     </div>
+  </div>
+  <div id="chatUsageBar" title="What the answers have cost on your Anthropic key this calendar month (UTC). Document search itself stays within Cloudflare's free allowance.">
+    <span>This month</span><strong id="chatUsageCost">…</strong><span id="chatUsageCount"></span>
   </div>
   <div id="chatLog">
     <div id="chatEmpty">Ask anything about the documents in Ressources/.<br />Answers come only from those files and cite the passages they rely on: click a number to open the document.</div>
@@ -3921,6 +4019,38 @@ function setChatOpen(open) {
   if (open && lastPointerType !== "touch") {
     setTimeout(function () { document.getElementById("chatInput").focus(); }, 60);
   }
+  // Fetched on every open: another device may have asked questions since.
+  if (open) loadChatUsage();
+}
+
+// ---- Cost counter ----
+function chatUsd(x) {
+  if (x > 0 && x < 0.01) return "<$0.01";
+  return "$" + x.toFixed(2);
+}
+
+function chatTokens(n) {
+  return n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n);
+}
+
+function showChatMonth(m, bump) {
+  document.getElementById("chatUsageCost").textContent = chatUsd(m.cost);
+  document.getElementById("chatUsageCount").textContent =
+    m.questions + " question" + (m.questions === 1 ? "" : "s");
+  if (bump) {
+    var bar = document.getElementById("chatUsageBar");
+    bar.classList.remove("bump");
+    void bar.offsetWidth; // restart the animation
+    bar.classList.add("bump");
+  }
+}
+
+function loadChatUsage() {
+  fetch("/api/chat/usage")
+    .then(checkAuth)
+    .then(function (res) { return res.ok ? res.json() : null; })
+    .then(function (m) { if (m) showChatMonth(m, false); })
+    .catch(function () { /* the counter is a nicety; the chat works without it */ });
 }
 
 function chatNearBottom() {
@@ -4122,6 +4252,17 @@ function renderAnswerFoot(a, sources) {
     err.textContent = a.error;
     foot.appendChild(err);
   }
+  if (a.usage) {
+    var cost = document.createElement("div");
+    cost.className = "chatCost";
+    var amount = document.createElement("strong");
+    amount.textContent = a.usage.cost < 0.01 ? "<$0.01" : "$" + a.usage.cost.toFixed(3);
+    cost.appendChild(document.createTextNode("This answer: "));
+    cost.appendChild(amount);
+    cost.appendChild(document.createTextNode(
+      " · " + chatTokens(a.usage.input) + " tokens in, " + chatTokens(a.usage.output) + " out"));
+    foot.appendChild(cost);
+  }
 }
 
 // Text arrives a few characters at a time; re-rendering on every one of them
@@ -4147,6 +4288,9 @@ function onChatEvent(a, ev) {
     queueRender(a);
   } else if (ev.t === "error") {
     a.error = ev.v;
+  } else if (ev.t === "usage") {
+    a.usage = ev;
+    if (ev.month) showChatMonth(ev.month, true);
   }
 }
 
