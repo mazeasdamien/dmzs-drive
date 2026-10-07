@@ -70,11 +70,16 @@ preview them.
 You'll need [Node.js](https://nodejs.org) installed. Then, from this folder:
 
 ```sh
+npm install              # the Anthropic SDK, used by "Ask your documents"
 npx wrangler login       # opens a browser to authorize wrangler with your Cloudflare account
 npx wrangler secret put AUTH_PASS     # choose a password — you'll be prompted to type it
 npx wrangler secret put TOTP_SECRET   # base32 seed for the authenticator app (see below)
+npx wrangler secret put ANTHROPIC_API_KEY   # for "Ask your documents" (see below)
 npx wrangler deploy
 ```
+
+The deploy needs the `drive-ressources` AI Search instance to exist already;
+creating it is described under [Ask your documents](#ask-your-documents).
 
 The drive is served on the custom domain configured in `wrangler.jsonc`
 (`drive.agentxr.app`). Signing in asks for the password plus a 6-digit code
@@ -85,7 +90,8 @@ To enroll the authenticator: generate a random base32 string (A–Z, 2–7; e.g.
 either by typing it in manually or via a QR code encoding
 `otpauth://totp/dmzs-drive:<your-name>?secret=<TOTP_SECRET>&issuer=dmzs-drive`.
 
-That's it — no build step, no database, no separate frontend hosting.
+That's it — no build step beyond `npm install`, no database, no separate
+frontend hosting.
 
 ### Using a custom domain (optional)
 
@@ -121,6 +127,67 @@ changes.
 Deleting a file moves it into a hidden `.trash/` area instead of destroying it.
 The Trash view in the UI lets you restore or permanently delete entries, and a
 daily cron (see `wrangler.jsonc`) purges anything older than 30 days.
+
+### Ask your documents
+
+The **Ask docs** button opens a chat panel that answers questions from the
+PDFs and Word files under `Ressources/`, citing the passages it relied on:
+each numbered marker opens the document, and the source list under an answer
+expands to show the exact cited text.
+
+Two pieces do the work:
+
+- **Cloudflare AI Search** indexes the files straight from the bucket. It
+  converts each document to text, splits it into chunks and embeds them, then
+  re-syncs on its own (hourly) when files are added or changed. For each
+  question the Worker asks it for the ten closest passages, by meaning and by
+  keyword at once; follow-up questions are rewritten with the earlier turns,
+  so "and in 2025?" still finds the right passages. There is deliberately no
+  reranking step: the available reranker is English-only and scored French
+  passages near zero, which filtered every result out. The search reads the
+  documents' text, not their file names, so ask about what a document says
+  rather than what it is called.
+- **Claude** (`claude-sonnet-5-5`, via the Anthropic API) writes the answer from
+  those passages only. They are passed as search results with citations
+  enabled, so every claim carries a pointer back to its passage, and the
+  model is told to say when the documents don't hold the answer instead of
+  guessing.
+
+The browser keeps the conversation (only the answers' text goes back with
+the next question, not the passages); the Worker stores nothing. The
+retrieved passages, and nothing else from the drive, are sent to the
+Anthropic API with each question.
+
+Setup, once:
+
+1. Create the AI Search instance. In the Cloudflare dashboard: **AI → AI
+   Search → Create instance**, name `drive-ressources`, data source **R2**
+   → bucket `dmzs-drive`, path filters include `Ressources/**/*.pdf` and
+   `Ressources/**/*.docx`, and turn **OCR** on. The dashboard also creates the service token AI Search uses to
+   read the bucket. Or, with a token carrying *AI Search: Edit* (plus *API
+   Tokens: Edit* the first time, for that service token):
+   `npx wrangler ai-search create drive-ressources --type r2 --source dmzs-drive --include-items "Ressources/**/*.pdf" "Ressources/**/*.docx"`,
+   then switch OCR on in the instance's settings.
+2. `npx wrangler secret put ANTHROPIC_API_KEY` with a key from
+   console.anthropic.com. For `npm run dev`, put the same line in `.dev.vars`.
+3. `npx wrangler deploy`. Indexing runs in the background; the instance's
+   Jobs tab in the dashboard shows progress and any file it skipped.
+
+What it can and can't read: PDFs up to 10 MiB with OCR on (4 MiB without),
+and `.docx`, up to 4 MiB. Larger files are skipped and show up in the job
+log, so compress or split them. **PowerPoint files are not supported**:
+export a deck to PDF to make it searchable. Photos and screenshots are left
+out of the index on purpose.
+
+Cost: AI Search includes 5 M indexing tokens, 10 GB of storage and 1,000
+searches a month, which a folder of a few dozen documents stays well within
+(billing starts on 1 November 2026); past 1,000 questions a month, searches
+cost $0.75 per thousand. The Claude side is what you actually pay for, on
+your Anthropic key: each question sends about ten passages plus their
+surrounding context, 15,000–30,000 tokens, and gets back a few thousand, which
+comes to roughly $0.05–0.08 a question with Claude Sonnet 5.5 (about twice
+that with Claude Opus 5.5). A monthly spend limit can be set at
+console.anthropic.com under Settings → Limits.
 
 ## 2. Syncing a folder from your PC
 

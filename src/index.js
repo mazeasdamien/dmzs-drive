@@ -18,11 +18,13 @@
 //   POST /api/trash/restore?key=.trash/x  -> move back to original location
 //   DELETE /api/trash/object?key=.trash/x -> delete permanently
 //   POST /api/trash/empty                 -> permanently delete the whole trash
+//   POST /api/chat {messages}             -> answer from the indexed documents (NDJSON stream)
 //   *    everything else                  -> the UI (login page when signed out)
 //
 // A daily cron (see wrangler.jsonc "triggers") purges trash entries older
 // than TRASH_RETENTION_DAYS.
 
+import Anthropic from "@anthropic-ai/sdk";
 import { ICON_192, ICON_512, APPLE_ICON } from "./icons.js";
 
 const TRASH = ".trash/";
@@ -122,6 +124,9 @@ export default {
       }
       if (url.pathname === "/api/usage" && request.method === "GET") {
         return await handleUsage(env);
+      }
+      if (url.pathname === "/api/chat" && request.method === "POST") {
+        return await handleChat(request, env, ctx);
       }
       if (url.pathname === "/api/trash/list" && request.method === "GET") {
         return await handleTrashList(env);
@@ -694,6 +699,177 @@ async function handleUsage(env) {
     cursor = page.truncated ? page.cursor : undefined;
   } while (cursor);
   return Response.json({ driveBytes, driveCount, trashBytes });
+}
+
+// ---------- Ask your documents ----------
+//
+// Answers questions from the documents in Ressources/. An AI Search instance
+// (the DOCS_SEARCH binding in wrangler.jsonc) indexes those files straight
+// from the bucket and re-syncs on its own; this route asks it for the
+// passages closest to the question, hands them to Claude as search results,
+// and streams the answer back along with the passages Claude cited.
+//
+// The reply is NDJSON, one event per line:
+//   {"t":"status","v":"searching"|"writing"}
+//   {"t":"consulted","docs":[{key,title}]}      every document retrieval returned
+//   {"t":"text","i":n,"v":"..."}                answer text for content block n
+//   {"t":"cite","i":n,"key","title","text"}     a passage block n draws on
+//   {"t":"error","v":"..."}
+//   {"t":"done"}
+// Citations are keyed by block rather than by position in the text because
+// the API may deliver a block's citation before or after its text.
+
+const CHAT_MODEL = "claude-sonnet-5-5";
+const CHAT_MAX_MESSAGES = 10;
+const CHAT_SYSTEM = `You answer questions about the user's own documents, stored in the Ressources folder of their personal drive: reports, presentations, proposals, letters, CVs and the like. With each question you get the passages that a search over those documents returned, as search results. Earlier turns of the conversation are included for context, without their passages.
+
+Base the answer on those passages and cite them. When they don't contain the answer, say so plainly and mention what the closest documents do cover, instead of filling the gap from general knowledge. If the user explicitly asks for something beyond their documents, you may answer it, saying that this part doesn't come from the documents.
+
+Quote figures, dates, names and identifiers exactly as they are written. Answer in the language of the question. Keep the answer as short as the question allows. The chat renders paragraphs, **bold**, "- " bullet lists, "1." numbered lists and "###" headings; it does not render tables.`;
+
+async function handleChat(request, env, ctx) {
+  if (!env.DOCS_SEARCH) {
+    return new Response("Document search isn't set up: the DOCS_SEARCH binding is missing.", { status: 503 });
+  }
+  if (!env.ANTHROPIC_API_KEY) {
+    return new Response("ANTHROPIC_API_KEY isn't set: run npx wrangler secret put ANTHROPIC_API_KEY.", { status: 503 });
+  }
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return new Response("Bad JSON", { status: 400 });
+  }
+  const history = chatHistory(body && body.messages);
+  if (!history) return new Response("Expected messages ending with a question", { status: 400 });
+
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const enc = new TextEncoder();
+  // Once the browser has gone away a write fails; from then on there is no
+  // one to stream to, so answerChat stops paying for tokens nobody will read.
+  let gone = false;
+  const send = (event) => {
+    if (gone) return;
+    writer.write(enc.encode(JSON.stringify(event) + "\n")).catch(() => { gone = true; });
+  };
+  const run = answerChat(env, history, send, () => gone)
+    .catch((err) => send({ t: "error", v: chatErrorMessage(err) }))
+    .finally(() => {
+      send({ t: "done" });
+      return writer.close().catch(() => {});
+    });
+  ctx.waitUntil(run);
+  return new Response(readable, {
+    headers: { "content-type": "application/x-ndjson; charset=utf-8", "cache-control": "no-store" },
+  });
+}
+
+// The browser keeps the conversation and sends it whole; only plain text
+// turns are accepted, ending with the user's question.
+function chatHistory(messages) {
+  if (!Array.isArray(messages)) return null;
+  const turns = messages
+    .slice(-CHAT_MAX_MESSAGES)
+    .filter((m) => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string" && m.content.trim())
+    .map((m) => ({ role: m.role, content: m.content.slice(0, 20000) }));
+  while (turns.length && turns[0].role !== "user") turns.shift();
+  if (!turns.length || turns[turns.length - 1].role !== "user") return null;
+  return turns;
+}
+
+async function answerChat(env, history, send, isGone) {
+  send({ t: "status", v: "searching" });
+  // Follow-ups ("and in 2025?") only make sense with the turns before them,
+  // so the search gets the recent conversation and rewrites it into a query.
+  // No reranking: the only reranker on offer (bge-reranker-base) is English,
+  // and it scores French passages near zero — measured at 0.01–0.2 on the
+  // right answer — so its threshold threw every result away. The hybrid
+  // (vector + keyword) ranking already puts the right document first.
+  const found = await env.DOCS_SEARCH.search({
+    messages: history.slice(-6),
+    ai_search_options: {
+      retrieval: { max_num_results: 10, context_expansion: 1 },
+      query_rewrite: { enabled: history.length > 1 },
+    },
+  });
+  const chunks = (found.chunks || []).filter((c) => c.text && c.item && c.item.key);
+  const consulted = [];
+  for (const c of chunks) {
+    if (!consulted.some((d) => d.key === c.item.key)) consulted.push({ key: c.item.key, title: fileTitle(c.item.key) });
+  }
+  send({ t: "consulted", docs: consulted });
+
+  const question = history[history.length - 1].content;
+  const content = chunks.map((c) => ({
+    type: "search_result",
+    source: c.item.key,
+    title: fileTitle(c.item.key),
+    content: passageBlocks(c.text),
+    citations: { enabled: true },
+  }));
+  content.push({
+    type: "text",
+    text: chunks.length ? question : "(The search returned no passages for this question.)\n\n" + question,
+  });
+
+  send({ t: "status", v: "writing" });
+  const client = new Anthropic({ apiKey: env.ANTHROPIC_API_KEY });
+  const stream = client.beta.messages.stream({
+    model: CHAT_MODEL,
+    max_tokens: 64000,
+    // If a safety classifier declines, the API retries on the model it
+    // recommends for that case instead of returning the refusal.
+    betas: ["server-side-fallback-2026-07-01"],
+    fallbacks: "default",
+    output_config: { effort: "medium" },
+    system: CHAT_SYSTEM,
+    messages: [...history.slice(0, -1), { role: "user", content }],
+  });
+  for await (const event of stream) {
+    if (isGone()) {
+      stream.abort();
+      return;
+    }
+    if (event.type !== "content_block_delta") continue;
+    const d = event.delta;
+    if (d.type === "text_delta") {
+      send({ t: "text", i: event.index, v: d.text });
+    } else if (d.type === "citations_delta" && d.citation.type === "search_result_location") {
+      send({ t: "cite", i: event.index, key: d.citation.source, title: d.citation.title, text: d.citation.cited_text });
+    }
+  }
+  const final = await stream.finalMessage();
+  if (final.stop_reason === "refusal") send({ t: "error", v: "Claude declined to answer this question." });
+}
+
+// Smaller blocks give Claude finer citation boundaries: it cites whole blocks,
+// so one block per chunk would make every citation the entire chunk.
+function passageBlocks(text) {
+  const blocks = [];
+  let cur = "";
+  for (const para of text.split(/\n\s*\n/)) {
+    const p = para.trim();
+    if (!p) continue;
+    cur = cur ? cur + "\n\n" + p : p;
+    if (cur.length >= 400) {
+      blocks.push({ type: "text", text: cur });
+      cur = "";
+    }
+  }
+  if (cur) blocks.push({ type: "text", text: cur });
+  return blocks.length ? blocks : [{ type: "text", text }];
+}
+
+function fileTitle(key) {
+  return key.split("/").pop();
+}
+
+function chatErrorMessage(err) {
+  if (err instanceof Anthropic.AuthenticationError) return "The Anthropic API key was rejected: check ANTHROPIC_API_KEY.";
+  if (err instanceof Anthropic.RateLimitError) return "Too many requests to Claude right now; try again in a moment.";
+  if (err instanceof Anthropic.APIError) return "Claude API error" + (err.status ? " " + err.status : "") + ": " + err.message;
+  return "Error: " + (err && err.message ? err.message : String(err));
 }
 
 // ---------- Trash ----------
@@ -1419,6 +1595,134 @@ const HTML = String.raw`<!doctype html>
     #previewHeader button { padding: 8px 12px; }
     #previewBody img, #previewBody video { max-width: 100%; max-height: 100%; }
   }
+  /* "Ask your documents": a panel on the right. It sits below the preview
+     overlay so a cited document opens on top of the conversation. On a wide
+     screen the page makes room for it rather than being covered. */
+  #chatPanel {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: 440px;
+    max-width: 100vw;
+    z-index: 9;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg);
+    border-left: 1px solid var(--border);
+    box-shadow: -8px 0 30px rgba(0, 0, 0, .18);
+    transform: translateX(100%);
+    visibility: hidden;
+    transition: transform .2s ease, visibility 0s linear .2s;
+  }
+  #chatPanel.open { transform: none; visibility: visible; transition: transform .2s ease, visibility 0s; }
+  @media (min-width: 1101px) {
+    body.chatOpen { padding-right: 440px; }
+    body.chatOpen #chatPanel { box-shadow: none; }
+  }
+  #chatHeader {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  #chatTitle { font-size: 15px; font-weight: 600; }
+  #chatScope { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .chatActions { display: flex; gap: 6px; flex-shrink: 0; }
+  #chatLog {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  #chatEmpty { color: var(--muted); font-size: 13px; line-height: 1.55; margin: auto 8px; text-align: center; }
+  .chatMsg { font-size: 14px; line-height: 1.55; overflow-wrap: anywhere; }
+  .chatMsg.user {
+    align-self: flex-end;
+    max-width: 85%;
+    padding: 8px 12px;
+    border-radius: 12px 12px 2px 12px;
+    background: var(--sel);
+    white-space: pre-wrap;
+  }
+  .chatBody p, .chatBody ul, .chatBody ol { margin: 0 0 8px; }
+  .chatBody ul, .chatBody ol { padding-left: 22px; }
+  .chatBody li { margin-bottom: 3px; }
+  .chatBody h3 { font-size: 14px; margin: 12px 0 4px; }
+  .chatBody code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; background: var(--hover); padding: 1px 4px; border-radius: 4px; }
+  .chatBody > :last-child { margin-bottom: 0; }
+  .chatStatus { color: var(--muted); font-size: 13px; }
+  .chatStatus::after { content: ""; animation: chatDots 1.2s steps(4, end) infinite; }
+  @keyframes chatDots { 0% { content: ""; } 25% { content: "."; } 50% { content: ".."; } 75% { content: "..."; } }
+  .chatError { color: var(--danger); font-size: 13px; margin-top: 6px; }
+  .chatNote { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  button.cite {
+    padding: 0 4px;
+    margin: 0 1px;
+    border: none;
+    border-radius: 4px;
+    background: var(--sel);
+    color: var(--accent);
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 1.4;
+    vertical-align: super;
+  }
+  button.cite:hover { background: var(--accent); color: white; }
+  .chatSources { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border); font-size: 12px; }
+  .chatSourcesLabel { color: var(--muted); margin-bottom: 4px; }
+  .chatSource summary {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    padding: 3px 0;
+    cursor: pointer;
+    list-style: none;
+  }
+  .chatSource summary::-webkit-details-marker { display: none; }
+  .chatSource summary:hover .srcName { color: var(--accent); }
+  .srcNum { color: var(--accent); font-weight: 600; flex-shrink: 0; }
+  .srcName { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .srcDir { color: var(--muted); flex-shrink: 0; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chatSource blockquote {
+    margin: 4px 0 6px 14px;
+    padding: 6px 10px;
+    border-left: 3px solid var(--border);
+    color: var(--muted);
+    white-space: pre-wrap;
+    max-height: 220px;
+    overflow-y: auto;
+  }
+  .chatSource .srcOpen { margin: 0 0 6px 14px; padding: 3px 10px; font-size: 12px; }
+  .chatDocLink { cursor: pointer; color: var(--fg); }
+  .chatDocLink:hover { color: var(--accent); }
+  #chatForm { display: flex; align-items: flex-end; gap: 8px; padding: 12px; border-top: 1px solid var(--border); }
+  #chatInput {
+    flex: 1;
+    min-width: 0;
+    resize: none;
+    max-height: 160px;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg);
+    color: var(--fg);
+    font: inherit;
+    font-size: 14px;
+    line-height: 1.4;
+  }
+  #chatInput:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  @media (max-width: 700px) {
+    #chatPanel { width: 100vw; border-left: none; }
+    #chatHeader { padding: 10px 12px; }
+    #chatHeader button, #chatForm button { padding: 8px 12px; }
+    /* Under 16px, iOS Safari zooms the page in when the field takes focus. */
+    #chatInput { font-size: 16px; }
+  }
 </style>
 </head>
 <body>
@@ -1432,6 +1736,7 @@ const HTML = String.raw`<!doctype html>
   </div>
   <div class="toolbar" id="toolbar">
     <input id="searchBox" type="search" placeholder="Search files…" />
+    <button id="chatBtn" title="Ask a question about your documents">Ask docs</button>
     <button id="viewToggleBtn">Grid view</button>
     <button id="newFolderBtn">New folder</button>
     <button id="uploadBtn" class="primary">Upload files</button>
@@ -1487,6 +1792,25 @@ const HTML = String.raw`<!doctype html>
   </div>
   <div id="previewBody"></div>
 </div>
+<aside id="chatPanel" aria-label="Ask your documents" aria-hidden="true">
+  <div id="chatHeader">
+    <div>
+      <div id="chatTitle">Ask your documents</div>
+      <div id="chatScope">PDFs and Word files in Ressources/</div>
+    </div>
+    <div class="chatActions">
+      <button id="chatNewBtn" title="Start a new conversation">New chat</button>
+      <button id="chatCloseBtn" title="Close (Esc)" aria-label="Close">&times;</button>
+    </div>
+  </div>
+  <div id="chatLog">
+    <div id="chatEmpty">Ask anything about the documents in Ressources/.<br />Answers come only from those files and cite the passages they rely on: click a number to open the document.</div>
+  </div>
+  <form id="chatForm">
+    <textarea id="chatInput" rows="1" placeholder="Ask a question…"></textarea>
+    <button id="chatSendBtn" class="primary" type="submit">Send</button>
+  </form>
+</aside>
 <script>
 var currentPrefix = "";
 var mode = "files"; // "files" | "trash" | "search"
@@ -1862,6 +2186,7 @@ function syncCompactToolbar() {
   // Short labels on a phone: "Upload files" and "Grid view" together overflow
   // the one toolbar row that has to hold them.
   document.getElementById("uploadBtn").textContent = narrowMQ.matches ? "Upload" : "Upload files";
+  document.getElementById("chatBtn").textContent = narrowMQ.matches ? "Ask" : "Ask docs";
   document.getElementById("backBtn").textContent = narrowMQ.matches ? "← Back" : "← Back to files";
   document.getElementById("viewToggleBtn").textContent = viewToggleLabel(folderViewStyle(currentPrefix));
   closeMenus();
@@ -3445,6 +3770,7 @@ document.addEventListener("keydown", function (e) {
   if (e.key === "Escape") {
     if (menuAnchor) closeMenus();
     else if (previewKey) closePreview();
+    else if (chatIsOpen()) setChatOpen(false);
     else if (document.getElementById("sidebar").classList.contains("open")) setDrawer(false);
     else if (selected.length) clearSelection();
     return;
@@ -3571,6 +3897,378 @@ if (narrowMQ.addEventListener) narrowMQ.addEventListener("change", syncCompactTo
 else if (narrowMQ.addListener) narrowMQ.addListener(syncCompactToolbar); // Safari < 14
 
 window.addEventListener("popstate", applyHash);
+
+// ---- Ask your documents ----
+// The conversation lives here and is sent whole with each question; the
+// Worker keeps nothing. Only the answers' text goes back as history, not the
+// passages, so each question gets a fresh search.
+var chatTurns = [];
+var chatAbort = null; // AbortController of the answer being streamed, if any
+var chatGen = 0;      // bumped by New chat, so a stopped answer can't touch the new conversation
+// Citation numbers travel inside the answer text as \u0001n\u0002 until the
+// renderer turns them into buttons; they can't collide with anything typed.
+var CITE_RE = /(\*\*[^*\n]+\*\*|\x60[^\x60\n]+\x60|\u0001\d+\u0002)/;
+
+function chatIsOpen() { return document.getElementById("chatPanel").classList.contains("open"); }
+
+function setChatOpen(open) {
+  var panel = document.getElementById("chatPanel");
+  panel.classList.toggle("open", open);
+  panel.setAttribute("aria-hidden", open ? "false" : "true");
+  document.body.classList.toggle("chatOpen", open);
+  // Not on touch: focusing would throw the keyboard over half the screen
+  // before the user has even read the panel.
+  if (open && lastPointerType !== "touch") {
+    setTimeout(function () { document.getElementById("chatInput").focus(); }, 60);
+  }
+}
+
+function chatNearBottom() {
+  var log = document.getElementById("chatLog");
+  return log.scrollHeight - log.scrollTop - log.clientHeight < 60;
+}
+
+function chatScrollEnd() {
+  var log = document.getElementById("chatLog");
+  log.scrollTop = log.scrollHeight;
+}
+
+function appendInline(el, text, makeCite) {
+  text.split(CITE_RE).forEach(function (part) {
+    if (!part) return;
+    var node;
+    if (part.charAt(0) === "\u0001") {
+      node = makeCite(parseInt(part.slice(1), 10));
+    } else if (part.length > 4 && part.slice(0, 2) === "**" && part.slice(-2) === "**") {
+      node = document.createElement("strong");
+      node.textContent = part.slice(2, -2);
+    } else if (part.length > 2 && part.charAt(0) === "\x60" && part.charAt(part.length - 1) === "\x60") {
+      node = document.createElement("code");
+      node.textContent = part.slice(1, -1);
+    } else {
+      node = document.createTextNode(part);
+    }
+    el.appendChild(node);
+  });
+}
+
+// Just enough Markdown for an answer: paragraphs, headings, bullet and
+// numbered lists, bold, inline code. Built from text nodes, so nothing in a
+// document or an answer is ever parsed as HTML.
+function renderRich(el, src, makeCite) {
+  el.innerHTML = "";
+  var list = null, para = null;
+  src.split("\n").forEach(function (line) {
+    var m;
+    if (!line.trim()) { list = null; para = null; return; }
+    if ((m = /^\s*#{1,6}\s+(.*)$/.exec(line))) {
+      list = null; para = null;
+      var h = document.createElement("h3");
+      appendInline(h, m[1], makeCite);
+      el.appendChild(h);
+      return;
+    }
+    if ((m = /^\s*([-*•]|\d+[.)])\s+(.*)$/.exec(line))) {
+      var tag = /\d/.test(m[1]) ? "OL" : "UL";
+      if (!list || list.tagName !== tag) {
+        list = document.createElement(tag);
+        if (tag === "OL") list.start = parseInt(m[1], 10);
+        el.appendChild(list);
+      }
+      var li = document.createElement("li");
+      appendInline(li, m[2], makeCite);
+      list.appendChild(li);
+      para = null;
+      return;
+    }
+    if (list && /^\s{2,}/.test(line)) { // wrapped continuation of a list item
+      appendInline(list.lastChild, " " + line.trim(), makeCite);
+      return;
+    }
+    list = null;
+    if (para) para.appendChild(document.createElement("br"));
+    else { para = document.createElement("p"); el.appendChild(para); }
+    appendInline(para, line, makeCite);
+  });
+}
+
+function newAnswer() {
+  var a = { blocks: [], consulted: [], error: null, done: false, queued: false };
+  a.el = document.createElement("div");
+  a.el.className = "chatMsg assistant";
+  a.statusEl = document.createElement("div");
+  a.statusEl.className = "chatStatus";
+  a.bodyEl = document.createElement("div");
+  a.bodyEl.className = "chatBody";
+  a.footEl = document.createElement("div");
+  a.el.appendChild(a.statusEl);
+  a.el.appendChild(a.bodyEl);
+  a.el.appendChild(a.footEl);
+  return a;
+}
+
+function answerText(a) {
+  return a.blocks.map(function (b) { return b ? b.text : ""; }).join("").trim();
+}
+
+// Sources are numbered by first citation, so [1] is always the first one the
+// reader meets. Each block's markers go at the end of its text, before any
+// trailing line break, so they stay on the line they qualify.
+function renderAnswer(a) {
+  var stick = chatNearBottom();
+  var sources = [];
+  function sourceNum(c) {
+    for (var k = 0; k < sources.length; k++) {
+      if (sources[k].key === c.key) {
+        if (sources[k].excerpts.indexOf(c.text) === -1) sources[k].excerpts.push(c.text);
+        return k + 1;
+      }
+    }
+    sources.push({ key: c.key, title: c.title || c.key.split("/").pop(), excerpts: [c.text] });
+    return sources.length;
+  }
+  var text = "";
+  a.blocks.forEach(function (b) {
+    var nums = [];
+    b.cites.forEach(function (c) {
+      var n = sourceNum(c);
+      if (nums.indexOf(n) === -1) nums.push(n);
+    });
+    var marks = nums.map(function (n) { return "\u0001" + n + "\u0002"; }).join("");
+    var tail = /\s*$/.exec(b.text);
+    text += b.text.slice(0, tail.index) + marks + tail[0];
+  });
+  renderRich(a.bodyEl, text, function (n) {
+    var s = sources[n - 1];
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "cite";
+    btn.textContent = n;
+    btn.title = s.title;
+    btn.onclick = function () { openPreview(s.key); };
+    return btn;
+  });
+  renderAnswerFoot(a, sources);
+  if (stick) chatScrollEnd();
+}
+
+function renderAnswerFoot(a, sources) {
+  var foot = a.footEl;
+  // The list is rebuilt on every render; a source the user has expanded
+  // must stay expanded while the answer is still streaming in.
+  var openKeys = Array.prototype.map.call(foot.querySelectorAll("details[open]"), function (d) { return d.dataset.key; });
+  foot.innerHTML = "";
+  if (sources.length) {
+    var box = document.createElement("div");
+    box.className = "chatSources";
+    var label = document.createElement("div");
+    label.className = "chatSourcesLabel";
+    label.textContent = "Sources: click one to see the cited passages";
+    box.appendChild(label);
+    sources.forEach(function (s, i) {
+      var d = document.createElement("details");
+      d.className = "chatSource";
+      d.dataset.key = s.key;
+      if (openKeys.indexOf(s.key) !== -1) d.open = true;
+      var sum = document.createElement("summary");
+      var num = document.createElement("span");
+      num.className = "srcNum";
+      num.textContent = (i + 1) + ".";
+      var name = document.createElement("span");
+      name.className = "srcName";
+      name.textContent = s.title;
+      name.title = s.key;
+      var dir = document.createElement("span");
+      dir.className = "srcDir";
+      dir.textContent = s.key.split("/").slice(0, -1).join("/");
+      sum.appendChild(num);
+      sum.appendChild(name);
+      sum.appendChild(dir);
+      d.appendChild(sum);
+      s.excerpts.forEach(function (t) {
+        var q = document.createElement("blockquote");
+        q.textContent = t.length > 1200 ? t.slice(0, 1200) + "…" : t;
+        d.appendChild(q);
+      });
+      var open = document.createElement("button");
+      open.type = "button";
+      open.className = "srcOpen";
+      open.textContent = "Open document";
+      open.onclick = function () { openPreview(s.key); };
+      d.appendChild(open);
+      box.appendChild(d);
+    });
+    foot.appendChild(box);
+  } else if (a.done && a.consulted.length && answerText(a)) {
+    // No citation at all usually means the answer is "not in the documents";
+    // say where it looked, so the user can check by hand.
+    var note = document.createElement("div");
+    note.className = "chatNote";
+    note.appendChild(document.createTextNode("Searched: "));
+    a.consulted.forEach(function (doc, i) {
+      if (i) note.appendChild(document.createTextNode(", "));
+      var link = document.createElement("span");
+      link.className = "chatDocLink";
+      link.textContent = doc.title;
+      link.title = doc.key;
+      link.onclick = function () { openPreview(doc.key); };
+      note.appendChild(link);
+    });
+    foot.appendChild(note);
+  }
+  if (a.error) {
+    var err = document.createElement("div");
+    err.className = "chatError";
+    err.textContent = a.error;
+    foot.appendChild(err);
+  }
+}
+
+// Text arrives a few characters at a time; re-rendering on every one of them
+// would redo the whole answer dozens of times a second for nothing.
+function queueRender(a) {
+  if (a.queued) return;
+  a.queued = true;
+  requestAnimationFrame(function () { a.queued = false; renderAnswer(a); });
+}
+
+function onChatEvent(a, ev) {
+  if (ev.t === "status") {
+    a.statusEl.textContent = ev.v === "searching" ? "Searching your documents"
+      : a.consulted.length ? "Reading " + a.consulted.length + " document" + (a.consulted.length > 1 ? "s" : "")
+      : "Writing";
+  } else if (ev.t === "consulted") {
+    a.consulted = ev.docs || [];
+  } else if (ev.t === "text" || ev.t === "cite") {
+    var b = a.blocks[ev.i] || (a.blocks[ev.i] = { text: "", cites: [] });
+    if (ev.t === "text") b.text += ev.v;
+    else b.cites.push({ key: ev.key, title: ev.title, text: ev.text });
+    if (a.statusEl.parentNode && answerText(a)) a.statusEl.remove();
+    queueRender(a);
+  } else if (ev.t === "error") {
+    a.error = ev.v;
+  }
+}
+
+function setChatBusy(busy) {
+  var btn = document.getElementById("chatSendBtn");
+  btn.textContent = busy ? "Stop" : "Send";
+  btn.classList.toggle("primary", !busy);
+}
+
+function finishAnswer(a) {
+  if (a.gen !== chatGen) return;
+  chatAbort = null;
+  setChatBusy(false);
+  a.done = true;
+  a.statusEl.remove();
+  var text = answerText(a);
+  if (text) chatTurns.push({ role: "assistant", content: text });
+  else {
+    // Nothing came back: drop the question too, so the next one doesn't go
+    // out stacked behind an unanswered turn.
+    chatTurns.pop();
+    if (!a.error) a.error = "No answer came back.";
+  }
+  renderAnswer(a);
+}
+
+function askChat(question) {
+  var log = document.getElementById("chatLog");
+  var empty = document.getElementById("chatEmpty");
+  if (empty) empty.remove();
+  var q = document.createElement("div");
+  q.className = "chatMsg user";
+  q.textContent = question;
+  log.appendChild(q);
+  chatTurns.push({ role: "user", content: question });
+  var a = newAnswer();
+  a.gen = chatGen;
+  a.statusEl.textContent = "Searching your documents";
+  log.appendChild(a.el);
+  chatScrollEnd();
+
+  var ctrl = new AbortController();
+  chatAbort = ctrl;
+  setChatBusy(true);
+  fetch("/api/chat", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ messages: chatTurns }),
+    signal: ctrl.signal
+  })
+    .then(checkAuth)
+    .then(function (res) {
+      if (!res.ok) return res.text().then(function (t) { throw new Error(t || "HTTP " + res.status); });
+      var reader = res.body.getReader();
+      var dec = new TextDecoder();
+      var buf = "";
+      function handle(line) {
+        if (!line.trim()) return;
+        try { onChatEvent(a, JSON.parse(line)); } catch (e) { /* torn line: skip */ }
+      }
+      function pump() {
+        return reader.read().then(function (r) {
+          if (r.done) { handle(buf); return; }
+          buf += dec.decode(r.value, { stream: true });
+          var lines = buf.split("\n");
+          buf = lines.pop();
+          lines.forEach(handle);
+          return pump();
+        });
+      }
+      return pump();
+    })
+    .catch(function (err) {
+      if (err.name === "AbortError") { if (!answerText(a)) a.error = "Stopped."; }
+      else a.error = err.message;
+    })
+    .then(function () { finishAnswer(a); });
+}
+
+function resetChat() {
+  if (chatAbort) chatAbort.abort();
+  chatAbort = null;
+  chatGen++;
+  setChatBusy(false);
+  chatTurns = [];
+  var log = document.getElementById("chatLog");
+  log.innerHTML = "";
+  var empty = document.createElement("div");
+  empty.id = "chatEmpty";
+  empty.innerHTML = "Ask anything about the documents in Ressources/.<br />Answers come only from those files and cite the passages they rely on: click a number to open the document.";
+  log.appendChild(empty);
+  document.getElementById("chatInput").focus();
+}
+
+function autosizeChatInput() {
+  var box = document.getElementById("chatInput");
+  box.style.height = "auto";
+  box.style.height = Math.min(box.scrollHeight + 2, 160) + "px";
+}
+
+document.getElementById("chatBtn").onclick = function () { setChatOpen(!chatIsOpen()); };
+document.getElementById("chatCloseBtn").onclick = function () { setChatOpen(false); };
+document.getElementById("chatNewBtn").onclick = resetChat;
+document.getElementById("chatForm").onsubmit = function (e) {
+  e.preventDefault();
+  if (chatAbort) { chatAbort.abort(); return; } // the button reads "Stop" meanwhile
+  var box = document.getElementById("chatInput");
+  var q = box.value.trim();
+  if (!q) return;
+  box.value = "";
+  autosizeChatInput();
+  askChat(q);
+};
+document.getElementById("chatInput").addEventListener("input", autosizeChatInput);
+document.getElementById("chatInput").addEventListener("keydown", function (e) {
+  // Enter sends, Shift+Enter starts a new line. Not mid-composition (IME), and
+  // not while an answer is streaming: Enter must never act as "Stop".
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+    e.preventDefault();
+    if (!chatAbort) document.getElementById("chatForm").requestSubmit();
+  }
+});
 
 syncCompactToolbar();
 setMode("files");

@@ -28,6 +28,17 @@
   "media": {
     "binding": "MEDIA"
   },
+  // The index behind "Ask your documents" (/api/chat). The instance reads the
+  // PDFs and Word files under Ressources/ straight from the bucket and keeps
+  // itself in sync; it has to exist before deploying (see README). remote:
+  // AI Search doesn't run locally, so `wrangler dev` uses the real index.
+  "ai_search": [
+    {
+      "binding": "DOCS_SEARCH",
+      "instance_name": "drive-ressources",
+      "remote": true
+    }
+  ],
   // Blunts brute-forcing of the login: the Worker checks this before it checks
   // the password, so an attacker gets a handful of guesses a minute per IP
   // rather than as many as the network allows. Counted per Cloudflare
@@ -39,8 +50,9 @@
       "simple": { "limit": 8, "period": 60 }
     }
   ]
-  // AUTH_PASS and TOTP_SECRET are SECRETS, not vars — set them with:
+  // AUTH_PASS, TOTP_SECRET and ANTHROPIC_API_KEY are SECRETS, not vars — set them with:
   //   npx wrangler secret put AUTH_PASS
   //   npx wrangler secret put TOTP_SECRET
-  // (never commit either into this file)
+  //   npx wrangler secret put ANTHROPIC_API_KEY
+  // (never commit any of them into this file)
 }
