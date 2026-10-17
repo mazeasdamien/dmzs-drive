@@ -32,6 +32,9 @@ import { ICON_192, ICON_512, APPLE_ICON } from "./icons.js";
 const TRASH = ".trash/";
 const CONFIG = ".config/"; // hidden technical area (share-link records live here)
 const SHARES = CONFIG + "shares/";
+const SESSIONS = CONFIG + "sessions/"; // one record per signed-in device
+const TOTP_LAST = CONFIG + "totp-last"; // last accepted code's time step
+const SESSION_COOKIE = "__Host-session";
 const SESSION_DAYS = 30;
 const TRASH_RETENTION_DAYS = 30;
 
@@ -118,11 +121,34 @@ export default {
     for (let i = 0; i < staleShares.length; i += 1000) {
       await env.DRIVE_BUCKET.delete(staleShares.slice(i, i + 1000));
     }
+
+    const staleSessions = [];
+    cursor = undefined;
+    do {
+      const page = await env.DRIVE_BUCKET.list({ prefix: SESSIONS, cursor, include: ["customMetadata"] });
+      for (const o of page.objects) {
+        if (parseInt((o.customMetadata || {}).exp || "0", 10) < now) staleSessions.push(o.key);
+      }
+      cursor = page.truncated ? page.cursor : undefined;
+    } while (cursor);
+    for (let i = 0; i < staleSessions.length; i += 1000) {
+      await env.DRIVE_BUCKET.delete(staleSessions.slice(i, i + 1000));
+    }
   },
 };
 
 async function route(request, env, ctx) {
   const url = new URL(request.url);
+
+  // Browsers say where a request comes from. Anything that changes state
+  // (every non-GET, and /api/sign, which records share links) must come from
+  // this site's own pages: SameSite=Lax alone still lets other *.agentxr.app
+  // sites, and top-level GETs from anywhere, carry the cookie.
+  const site = request.headers.get("sec-fetch-site");
+  const changes = !["GET", "HEAD"].includes(request.method) || url.pathname === "/api/sign";
+  if (changes && site && site !== "same-origin") {
+    return new Response("Cross-site request refused", { status: 403 });
+  }
 
   if (url.pathname === "/api/login" && request.method === "POST") {
     return handleLogin(request, env);
@@ -155,7 +181,7 @@ async function route(request, env, ctx) {
 
   try {
     if (url.pathname === "/api/logout" && request.method === "POST") {
-      return handleLogout();
+      return await handleLogout(request, env);
     }
     if (url.pathname === "/api/list" && request.method === "GET") {
       return await handleList(url, env);
@@ -253,44 +279,78 @@ async function handleLogin(request, env) {
   } catch {}
 
   const passOk = !!env.AUTH_PASS && (await safeEqual(body.password || "", env.AUTH_PASS));
-  const codeOk = !!env.TOTP_SECRET && (await verifyTotp(env.TOTP_SECRET, body.code || ""));
-  if (!passOk || !codeOk) {
+  const step = env.TOTP_SECRET ? await verifyTotp(env.TOTP_SECRET, body.code || "") : -1;
+  // A code is good for one sign-in: without this, the same six digits worked
+  // again for the rest of their ~90 s window.
+  let fresh = false;
+  if (passOk && step >= 0) {
+    const last = await env.DRIVE_BUCKET.head(TOTP_LAST);
+    fresh = step > parseInt(((last && last.customMetadata) || {}).step || "-1", 10);
+    if (fresh) await env.DRIVE_BUCKET.put(TOTP_LAST, new Uint8Array(), { customMetadata: { step: String(step) } });
+  }
+  if (!passOk || !fresh) {
     await new Promise((r) => setTimeout(r, 800)); // slow down brute-force attempts
     return new Response("Invalid credentials", { status: 401 });
   }
 
+  // Each sign-in gets a record, so logging out really ends the session
+  // instead of only forgetting the cookie in this one browser.
   const maxAge = SESSION_DAYS * 86400;
   const exp = Math.floor(Date.now() / 1000) + maxAge;
-  const token = exp + "." + (await hmacHex(sessionKey(env), String(exp)));
+  const id = crypto.randomUUID();
+  await env.DRIVE_BUCKET.put(SESSIONS + id, new Uint8Array(), {
+    customMetadata: { exp: String(exp), agent: (request.headers.get("user-agent") || "").slice(0, 200) },
+  });
+  const token = id + "." + exp + "." + (await hmacHex(sessionKey(env), "session|" + id + "|" + exp));
   return new Response("OK", {
     headers: {
-      "Set-Cookie": `session=${token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${maxAge}`,
+      "Set-Cookie": `${SESSION_COOKIE}=${token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${maxAge}`,
     },
   });
 }
 
-function handleLogout() {
+async function handleLogout(request, env) {
+  const s = await parseSession(request, env);
+  if (s) {
+    await env.DRIVE_BUCKET.delete(SESSIONS + s.id);
+    knownSessions.delete(s.id);
+  }
   return new Response("OK", {
-    headers: { "Set-Cookie": "session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0" },
+    headers: { "Set-Cookie": `${SESSION_COOKIE}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0` },
   });
 }
 
-// Sessions are self-contained: "<expiry>.<hmac>". Changing either secret
-// invalidates every outstanding session.
+// Changing either secret invalidates every outstanding session and link.
 function sessionKey(env) {
   return env.AUTH_PASS + "|" + env.TOTP_SECRET;
 }
 
-async function isAuthed(request, env) {
-  if (!env.AUTH_PASS || !env.TOTP_SECRET) return false;
+// The cookie is "<id>.<expiry>.<hmac>": the signature proves it was issued
+// here, the record under .config/sessions/ that it hasn't been logged out.
+async function parseSession(request, env) {
+  if (!env.AUTH_PASS || !env.TOTP_SECRET) return null;
   const cookie = request.headers.get("Cookie") || "";
-  const m = cookie.match(/(?:^|;\s*)session=([^;]+)/);
-  if (!m) return false;
-  const [expStr, sig] = m[1].split(".");
+  const m = cookie.match(/(?:^|;\s*)__Host-session=([^;]+)/);
+  if (!m) return null;
+  const [id, expStr, sig] = m[1].split(".");
   const exp = parseInt(expStr, 10);
-  if (!exp || Math.floor(Date.now() / 1000) > exp) return false;
-  const expected = await hmacHex(sessionKey(env), expStr);
-  return safeEqual(sig || "", expected);
+  if (!/^[0-9a-f-]{36}$/.test(id || "") || !exp || Math.floor(Date.now() / 1000) > exp) return null;
+  const expected = await hmacHex(sessionKey(env), "session|" + id + "|" + expStr);
+  return (await safeEqual(sig || "", expected)) ? { id, exp } : null;
+}
+
+// Record lookups are remembered for a minute per isolate, so a folder of
+// thumbnails doesn't cost one R2 read each; a logout elsewhere takes effect
+// within that minute.
+const knownSessions = new Map();
+async function isAuthed(request, env) {
+  const s = await parseSession(request, env);
+  if (!s) return false;
+  const seen = knownSessions.get(s.id);
+  if (seen && Date.now() - seen < 60000) return true;
+  if (!(await env.DRIVE_BUCKET.head(SESSIONS + s.id))) return false;
+  knownSessions.set(s.id, Date.now());
+  return true;
 }
 
 async function hmacHex(secret, msg) {
@@ -323,9 +383,11 @@ const SIGNED_URL_TTL_SECONDS = 300;
 async function handleSign(url, env) {
   const key = url.searchParams.get("key");
   if (!key) return new Response("Missing key", { status: 400 });
-  // Default 5 min (previews); share links may ask for up to 7 days.
+  // 5 min for previews; only share links, which are recorded and can be
+  // revoked, may ask for up to 7 days.
   const requested = parseInt(url.searchParams.get("ttl") || "", 10);
-  const ttl = Math.min(Math.max(requested || SIGNED_URL_TTL_SECONDS, 60), 7 * 86400);
+  const longest = url.searchParams.get("share") === "1" ? 7 * 86400 : SIGNED_URL_TTL_SECONDS;
+  const ttl = Math.min(Math.max(requested || SIGNED_URL_TTL_SECONDS, 60), longest);
   const exp = Math.floor(Date.now() / 1000) + ttl;
 
   if (url.searchParams.get("share") === "1") {
@@ -411,14 +473,15 @@ async function handleShareRevokeAll(env) {
 
 // ---------- TOTP (RFC 6238, SHA-1, 30s steps, 6 digits) ----------
 
+// Returns the time step the code belongs to, or -1 if it matches none.
 async function verifyTotp(secretB32, code) {
-  if (!/^\d{6}$/.test(code)) return false;
+  if (!/^\d{6}$/.test(code)) return -1;
   const key = base32Decode(secretB32);
   const step = Math.floor(Date.now() / 1000 / 30);
   for (let w = -1; w <= 1; w++) { // allow one step of clock drift either way
-    if ((await hotp(key, step + w)) === code) return true;
+    if ((await hotp(key, step + w)) === code) return step + w;
   }
-  return false;
+  return -1;
 }
 
 async function hotp(keyBytes, counter) {
@@ -837,6 +900,17 @@ async function handleChat(request, env, ctx) {
   }
   const history = chatHistory(body && body.messages);
   if (!history) return new Response("Expected messages ending with a question", { status: 400 });
+
+  // A ceiling on what the chat can spend in a month (CHAT_MONTHLY_BUDGET in
+  // wrangler.jsonc, in dollars), so a loop or a stolen session can't run up
+  // the Anthropic bill.
+  const budget = parseFloat(env.CHAT_MONTHLY_BUDGET || "20");
+  if ((await readChatUsage(env)).cost >= budget) {
+    return new Response(
+      "This month's chat budget ($" + budget.toFixed(2) + ") is used up. Raise CHAT_MONTHLY_BUDGET in wrangler.jsonc to keep going.",
+      { status: 429 },
+    );
+  }
 
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();

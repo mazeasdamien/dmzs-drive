@@ -103,6 +103,10 @@ Routes → Add a custom domain.
 
 Every request is checked for a signed session cookie; sessions are created by
 `POST /api/login` with the password **and** a valid TOTP code, and last 30 days.
+Each sign-in also leaves a record in `.config/sessions/`, so Log out really
+ends that session (on every device holding the cookie, within a minute), and a
+6-digit code works for one sign-in only. Requests that change anything are
+refused unless the browser says they came from the drive's own pages.
 
 Login attempts are rate limited to 8 a minute per IP (the `LOGIN_LIMIT` binding
 in `wrangler.jsonc`), checked before the password is, and a failed attempt is
@@ -186,8 +190,9 @@ cost $0.75 per thousand. The Claude side is what you actually pay for, on
 your Anthropic key: each question sends about ten passages plus their
 surrounding context, 15,000–30,000 tokens, and gets back a few thousand, which
 comes to roughly $0.05–0.08 a question with Claude Sonnet 5.5 (about twice
-that with Claude Opus 5.5). A monthly spend limit can be set at
-console.anthropic.com under Settings → Limits.
+that with Claude Opus 5.5). The Worker stops taking questions once the month
+has cost `CHAT_MONTHLY_BUDGET` dollars (`wrangler.jsonc`, 20 by default); a
+hard limit can also be set at console.anthropic.com under Settings → Limits.
 
 The panel keeps count: a strip under its title shows what the answers have
 cost so far this month and how many questions that was, and each answer shows

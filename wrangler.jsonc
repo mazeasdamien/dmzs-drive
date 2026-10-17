@@ -49,7 +49,13 @@
       "namespace_id": "1001",
       "simple": { "limit": 8, "period": 60 }
     }
-  ]
+  ],
+  "vars": {
+    // Most the "Ask your documents" chat may spend on the Anthropic key in a
+    // calendar month, in dollars; past it, questions are refused until the
+    // 1st. The running total shows at the top of the chat panel.
+    "CHAT_MONTHLY_BUDGET": "20"
+  }
   // AUTH_PASS, TOTP_SECRET and ANTHROPIC_API_KEY are SECRETS, not vars — set them with:
   //   npx wrangler secret put AUTH_PASS
   //   npx wrangler secret put TOTP_SECRET
