@@ -142,7 +142,7 @@ async function route(request, env, ctx) {
   // Time-limited signed links: lets the Office preview's external viewer
   // fetch a document without our session cookie. Signed, single-file, 5 min.
   if (url.pathname === "/api/object" && request.method === "GET" && url.searchParams.has("sig")) {
-    if (await verifySignedUrl(url, env)) return handleDownload(url, env);
+    if (await verifySignedUrl(url, env)) return handleDownload(request, url, env);
     return new Response("Invalid or expired link", { status: 403 });
   }
 
@@ -162,7 +162,7 @@ async function route(request, env, ctx) {
     }
     if (url.pathname === "/api/object") {
       if (request.method === "PUT") return await handleUpload(request, url, env);
-      if (request.method === "GET") return await handleDownload(url, env);
+      if (request.method === "GET") return await handleDownload(request, url, env);
       if (request.method === "DELETE") return await handleSoftDelete(url, env);
     }
     if (url.pathname === "/api/thumb" && request.method === "GET") {
@@ -455,9 +455,18 @@ function base32Decode(s) {
 
 async function handleList(url, env) {
   const prefix = url.searchParams.get("prefix") || "";
-  const listed = await env.DRIVE_BUCKET.list({ prefix, delimiter: "/" });
+  // R2 returns at most 1000 entries a call: follow the cursor, or a big
+  // folder is silently cut short (and so is anything that acts on it).
+  const listed = { objects: [], delimitedPrefixes: [] };
+  let pageCursor;
+  do {
+    const page = await env.DRIVE_BUCKET.list({ prefix, delimiter: "/", cursor: pageCursor });
+    listed.objects.push(...page.objects);
+    listed.delimitedPrefixes.push(...(page.delimitedPrefixes || []));
+    pageCursor = page.truncated ? page.cursor : undefined;
+  } while (pageCursor);
 
-  const folderNames = (listed.delimitedPrefixes || []).filter((p) => p !== TRASH && p !== CONFIG).sort();
+  const folderNames = listed.delimitedPrefixes.filter((p) => p !== TRASH && p !== CONFIG).sort();
   const files = listed.objects
     .filter((o) => o.key !== prefix) // hide the folder's own zero-byte marker, if any
     .map((o) => ({ key: o.key, size: o.size, uploaded: o.uploaded }))
@@ -516,16 +525,29 @@ async function handleUpload(request, url, env) {
   return new Response("OK");
 }
 
-async function handleDownload(url, env) {
+async function handleDownload(request, url, env) {
   const key = url.searchParams.get("key");
   if (!key) return new Response("Missing key", { status: 400 });
 
-  const object = await env.DRIVE_BUCKET.get(key);
+  // Range and If-None-Match are handed straight to R2: Safari won't play or
+  // seek a video unless it can fetch it in pieces, and a file the browser
+  // already holds comes back as a bodiless 304.
+  const object = await env.DRIVE_BUCKET.get(key, { range: request.headers, onlyIf: request.headers });
   if (!object) return new Response("Not found", { status: 404 });
 
   const headers = new Headers();
   object.writeHttpMetadata(headers);
   headers.set("etag", object.httpEtag);
+  headers.set("accept-ranges", "bytes");
+  if (!("body" in object)) return new Response(null, { status: 304, headers });
+  let status = 200;
+  if (object.range && request.headers.has("range")) {
+    const r = object.range;
+    const start = "suffix" in r ? object.size - r.suffix : r.offset || 0;
+    const end = "suffix" in r ? object.size - 1 : start + (r.length ?? object.size - start) - 1;
+    headers.set("content-range", `bytes ${start}-${end}/${object.size}`);
+    status = 206;
+  }
   const filename = key.split("/").pop();
   if (url.searchParams.get("view") === "1") {
     // Inline viewing (PDFs, images, text render natively in the browser).
@@ -555,7 +577,7 @@ async function handleDownload(url, env) {
     headers.set("Content-Disposition", `attachment; filename="${filename}"`);
     headers.set("content-security-policy", FILE_CSP);
   }
-  return new Response(object.body, { headers });
+  return new Response(object.body, { status, headers });
 }
 
 function sniffType(b) {
@@ -1340,6 +1362,24 @@ const HTML = String.raw`<!doctype html>
     border-radius: 3px;
     transition: width .2s;
   }
+  /* Failed requests used to vanish: the page just didn't change. This says so. */
+  #errorBar {
+    position: fixed;
+    left: 50%;
+    top: calc(12px + env(safe-area-inset-top));
+    transform: translateX(-50%);
+    z-index: 30;
+    max-width: calc(100vw - 24px);
+    padding: 10px 14px;
+    border-radius: 10px;
+    background: var(--danger);
+    color: white;
+    font-size: 14px;
+    box-shadow: 0 8px 30px rgba(0, 0, 0, .3);
+    cursor: pointer;
+    display: none;
+  }
+  #errorBar.show { display: block; }
   #layout { display: flex; }
   #sidebar {
     width: 220px;
@@ -1559,7 +1599,7 @@ const HTML = String.raw`<!doctype html>
     box-sizing: border-box;
   }
   #previewBody .textPreview { align-self: stretch; flex: 1; width: 100%; }
-  #previewBody img { max-width: 95%; max-height: 95%; object-fit: contain; }
+  #previewBody img { max-width: 95%; max-height: 95%; object-fit: contain; touch-action: none; transition: transform .05s; }
   #previewBody video { max-width: 95%; max-height: 95%; }
   .noPreview { color: #eee; text-align: center; padding: 24px; }
   #hoverPreview {
@@ -1937,6 +1977,7 @@ const HTML = String.raw`<!doctype html>
     <button id="moreBtn" title="More actions" aria-label="More actions" style="display:none">&hellip;</button>
   </div>
 </header>
+<div id="errorBar" role="alert" title="Dismiss"></div>
 <div id="sidebarBackdrop"></div>
 <div id="overflowMenu" class="menu"></div>
 <div id="itemMenu" class="menu"></div>
@@ -2065,6 +2106,32 @@ function checkAuth(res) {
   if (res.status === 401) { window.location.reload(); throw new Error("session expired"); }
   return res;
 }
+
+// For calls whose result the page needs: a non-2xx answer becomes an error
+// (which then shows in the bar below) instead of being parsed as data.
+function okJson(res) {
+  checkAuth(res);
+  if (!res.ok) throw new Error("The server answered " + res.status + ".");
+  return res.json();
+}
+
+var errorTimer = null;
+function showError(msg) {
+  var bar = document.getElementById("errorBar");
+  bar.textContent = msg;
+  bar.classList.add("show");
+  clearTimeout(errorTimer);
+  errorTimer = setTimeout(function () { bar.classList.remove("show"); }, 7000);
+}
+document.getElementById("errorBar").onclick = function () { this.classList.remove("show"); };
+// Anything that fails without its own handler ends up here rather than
+// nowhere: offline, a 500, a server that went away mid-request.
+window.addEventListener("unhandledrejection", function (e) {
+  var err = e.reason || {};
+  if (err.message === "session expired") return;
+  var offline = err instanceof TypeError && /fetch|load failed|network/i.test(err.message || "");
+  showError(offline ? "Network error: check your connection." : (err.message || "Something went wrong."));
+});
 
 function setMode(m) {
   // Cheap no-op unless the width crossed the phone breakpoint; belt and braces
@@ -2657,8 +2724,7 @@ function load(prefix, fromHistory) {
   renderBreadcrumb();
   var gen = ++listGen;
   return fetch("/api/list?prefix=" + encodeURIComponent(prefix))
-    .then(checkAuth)
-    .then(function (res) { return res.json(); })
+    .then(okJson)
     .then(function (data) {
       if (gen !== listGen) return;
       sortList(data.folders,
@@ -2871,8 +2937,7 @@ function loadTrash() {
   renderBreadcrumb();
   var gen = ++listGen;
   return fetch("/api/trash/list")
-    .then(checkAuth)
-    .then(function (res) { return res.json(); })
+    .then(okJson)
     .then(function (data) {
       if (gen !== listGen) return;
       var rows = document.getElementById("rows");
@@ -2910,8 +2975,7 @@ function loadShares() {
   renderBreadcrumb();
   var gen = ++listGen;
   return fetch("/api/shares")
-    .then(checkAuth)
-    .then(function (res) { return res.json(); })
+    .then(okJson)
     .then(function (data) {
       if (gen !== listGen) return;
       var rows = document.getElementById("rows");
@@ -3017,13 +3081,20 @@ function textPreviewNode(url) {
   var pre = document.createElement("pre");
   pre.className = "textPreview";
   pre.textContent = "Loading…";
-  fetch(url)
+  // Only the start of the file is fetched: a 500 MB log used to be downloaded
+  // whole just to show its first lines (UTF-8 is at most 4 bytes a character).
+  fetch(url, { headers: { Range: "bytes=0-" + (TEXT_PREVIEW_MAX * 4 - 1) } })
     .then(checkAuth)
-    .then(function (res) { return res.text(); })
-    .then(function (text) {
+    .then(function (res) {
+      var m = /\/(\d+)$/.exec(res.headers.get("content-range") || "");
+      var cut = res.status === 206 && !!m && parseInt(m[1], 10) > TEXT_PREVIEW_MAX * 4;
+      return res.text().then(function (text) { return { text: text, cut: cut }; });
+    })
+    .then(function (got) {
       if (!pre.isConnected) return; // preview was closed, or moved to another file
+      var text = got.text;
       // A multi-megabyte log would otherwise freeze the tab laying it out.
-      if (text.length > TEXT_PREVIEW_MAX) {
+      if (got.cut || text.length > TEXT_PREVIEW_MAX) {
         text = text.slice(0, TEXT_PREVIEW_MAX) +
           "\n\n… truncated — use Download to get the whole file.";
       }
@@ -3039,6 +3110,62 @@ function extOf(key) {
   var name = key.split("/").pop();
   var dot = name.lastIndexOf(".");
   return dot === -1 ? "" : name.slice(dot + 1).toLowerCase();
+}
+
+// The page itself doesn't zoom (see the viewport meta), so a photo in the
+// preview zooms on its own: pinch to scale, drag to pan once zoomed in,
+// double-tap to jump between fit and 2.5x.
+function pinchZoom(img) {
+  var scale = 1, tx = 0, ty = 0;
+  var start = null, lastTap = 0;
+  function apply() {
+    // Keep the picture over the screen: no panning it out of sight.
+    var maxX = img.clientWidth * (scale - 1) / 2, maxY = img.clientHeight * (scale - 1) / 2;
+    tx = Math.max(-maxX, Math.min(maxX, tx));
+    ty = Math.max(-maxY, Math.min(maxY, ty));
+    img.style.transform = scale === 1 ? "" : "translate(" + tx + "px," + ty + "px) scale(" + scale + ")";
+  }
+  function dist(t) { return Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY); }
+  img.addEventListener("touchstart", function (e) {
+    var t = e.touches;
+    if (t.length === 2) {
+      start = { d: dist(t), scale: scale };
+    } else if (t.length === 1) {
+      var now = Date.now();
+      if (now - lastTap < 300) {
+        scale = scale > 1 ? 1 : 2.5; tx = 0; ty = 0;
+        apply();
+        e.preventDefault();
+        lastTap = 0;
+        return;
+      }
+      lastTap = now;
+      start = { x: t[0].clientX - tx, y: t[0].clientY - ty };
+    }
+  }, { passive: false });
+  img.addEventListener("touchmove", function (e) {
+    var t = e.touches;
+    if (!start) return;
+    if (t.length === 2 && start.d) {
+      scale = Math.max(1, Math.min(6, start.scale * dist(t) / start.d));
+      apply();
+      e.preventDefault();
+    } else if (t.length === 1 && scale > 1 && start.x !== undefined) {
+      tx = t[0].clientX - start.x;
+      ty = t[0].clientY - start.y;
+      apply();
+      e.preventDefault();
+    }
+  }, { passive: false });
+  img.addEventListener("touchend", function (e) {
+    if (e.touches.length === 0) {
+      start = null;
+      if (scale < 1.05) { scale = 1; tx = 0; ty = 0; apply(); }
+    } else if (e.touches.length === 1) {
+      // One finger lifted mid-pinch: carry on as a pan from here.
+      start = { x: e.touches[0].clientX - tx, y: e.touches[0].clientY - ty };
+    }
+  });
 }
 
 function closePreview() {
@@ -3098,6 +3225,7 @@ function openPreview(key) {
   if (images.indexOf(ext) !== -1) {
     var img = document.createElement("img");
     img.src = inlineUrl;
+    pinchZoom(img);
     body.appendChild(img);
   } else if (ext === "pdf") {
     var frame = document.createElement("iframe");
@@ -3124,8 +3252,7 @@ function openPreview(key) {
     note.textContent = "Loading preview…";
     body.appendChild(note);
     fetch("/api/sign?key=" + encodeURIComponent(key))
-      .then(checkAuth)
-      .then(function (res) { return res.json(); })
+      .then(okJson)
       .then(function (data) {
         if (previewKey !== key) return; // preview was closed meanwhile
         body.innerHTML = "";
@@ -3151,6 +3278,7 @@ function openPreview(key) {
         if (ct.indexOf("image/") === 0) {
           var img2 = document.createElement("img");
           img2.src = inlineUrl;
+          pinchZoom(img2);
           body.appendChild(img2);
         } else if (ct === "application/pdf") {
           var frame2 = document.createElement("iframe");
@@ -3246,8 +3374,7 @@ function moveItems(items, destPrefix) {
     }
     var to = folderTarget(k, destPrefix);
     return fetch("/api/keys?prefix=" + encodeURIComponent(k))
-      .then(checkAuth)
-      .then(function (res) { return res.json(); })
+      .then(okJson)
       .then(function (data) {
         return data.keys.map(function (sub) { return { from: sub, to: to + sub.slice(k.length) }; });
       });
@@ -3313,8 +3440,7 @@ function loadSearch() {
   renderBreadcrumb();
   var gen = ++listGen;
   return fetch("/api/search?q=" + encodeURIComponent(searchQuery))
-    .then(checkAuth)
-    .then(function (res) { return res.json(); })
+    .then(okJson)
     .then(function (data) {
       // Navigated away, or typed further, while this was in flight.
       if (gen !== listGen) return;
@@ -3365,8 +3491,7 @@ function shareFile(key) {
   var ttl = Math.round(parseFloat(hours) * 3600);
   if (!ttl || ttl < 0) { alert("Invalid duration."); return; }
   fetch("/api/sign?key=" + encodeURIComponent(key) + "&ttl=" + ttl + "&share=1")
-    .then(checkAuth)
-    .then(function (res) { return res.json(); })
+    .then(okJson)
     .then(function (data) {
       var fallback = function () { prompt("Copy the share link:", data.url); };
       if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -3381,8 +3506,7 @@ function shareFile(key) {
 
 function refreshUsage() {
   fetch("/api/usage")
-    .then(checkAuth)
-    .then(function (res) { return res.json(); })
+    .then(okJson)
     .then(function (u) {
       var txt = humanSize(u.driveBytes) + " used · " + u.driveCount + " files";
       if (u.trashBytes) txt += " · trash " + humanSize(u.trashBytes);
@@ -3583,8 +3707,7 @@ function dragKind(e) {
 function movePrefixWithProgress(srcPrefix, destPrefix, label) {
   setProgress("Preparing…", 0, 1);
   fetch("/api/keys?prefix=" + encodeURIComponent(srcPrefix))
-    .then(checkAuth)
-    .then(function (res) { return res.json(); })
+    .then(okJson)
     .then(function (data) {
       runMoves(data.keys.map(function (k) {
         return { from: k, to: destPrefix + k.slice(srcPrefix.length) };
@@ -3650,8 +3773,7 @@ function treeNode(prefix, name, depth) {
     if (loaded) return;
     loaded = true;
     fetch("/api/list?prefix=" + encodeURIComponent(prefix))
-      .then(checkAuth)
-      .then(function (res) { return res.json(); })
+      .then(okJson)
       .then(function (data) {
         data.folders.forEach(function (sub) {
           children.appendChild(treeNode(sub.prefix, sub.prefix.slice(prefix.length).replace(/\/$/, ""), depth + 1));
@@ -3686,42 +3808,74 @@ function updateTreeActive() {
 function removeFile(key) {
   if (!confirm("Move " + key.split("/").pop() + " to the trash?")) return;
   fetch("/api/object?key=" + encodeURIComponent(key), { method: "DELETE" })
-    .then(checkAuth).then(function () { refreshUsage(); refresh(); });
+    .then(checkAuth).then(function (res) {
+      if (!res.ok) showError("Could not move " + key.split("/").pop() + " to the trash.");
+      refreshUsage(); refresh();
+    });
 }
 
 function removeFolder(prefix) {
   if (!confirm("Move folder " + prefix + " and everything inside it to the trash?")) return;
-  deleteFolderContents(prefix).then(function () { initTree(); refreshUsage(); refresh(); });
+  deleteFolderContents(prefix)
+    .catch(function (err) { hideProgress(); showError(err.message); })
+    .then(function () { initTree(); refreshUsage(); refresh(); });
 }
 
-// Recursively soft-deletes everything under prefix, then the folder marker itself.
-// Lists only the first 1000 entries per level (no cursor pagination) — plenty
-// for a personal drive, but a folder with 1000+ direct items would need re-running.
+// Soft-deletes everything under prefix, the folder marker included. The key
+// list comes from /api/keys, which follows R2's cursor, so a folder of any
+// size goes whole; deletes run three at a time and any failure is reported
+// (the promise rejects) instead of being skipped over.
 function deleteFolderContents(prefix) {
-  return fetch("/api/list?prefix=" + encodeURIComponent(prefix))
-    .then(checkAuth)
-    .then(function (res) { return res.json(); })
+  setProgress("Preparing…", 0, 1);
+  return fetch("/api/keys?prefix=" + encodeURIComponent(prefix))
+    .then(okJson)
     .then(function (data) {
-      var deletes = data.files.map(function (f) {
-        return fetch("/api/object?key=" + encodeURIComponent(f.key), { method: "DELETE" });
+      // Files before folder markers, so a half-finished run never leaves
+      // files sitting under a folder that no longer shows.
+      var keys = data.keys.slice().sort(function (a, b) {
+        return (a.slice(-1) === "/") - (b.slice(-1) === "/") || b.length - a.length;
       });
-      var subfolders = data.folders.map(function (sub) { return deleteFolderContents(sub.prefix); });
-      return Promise.all(deletes.concat(subfolders));
-    })
-    .then(function () {
-      return fetch("/api/object?key=" + encodeURIComponent(prefix), { method: "DELETE" });
+      if (keys.indexOf(prefix) === -1) keys.push(prefix);
+      var idx = 0, done = 0, failed = 0;
+      return new Promise(function (resolve, reject) {
+        function pump() {
+          while (idx - done < 3 && idx < keys.length) {
+            var k = keys[idx++];
+            fetchRetry("/api/object?key=" + encodeURIComponent(k), { method: "DELETE" })
+              .then(checkAuth)
+              .then(function (res) { if (!res.ok) failed++; }, function () { failed++; })
+              .then(function () {
+                done++;
+                setProgress("Moving to trash: " + done + "/" + keys.length, done, keys.length);
+                if (done === keys.length) {
+                  hideProgress();
+                  if (failed) reject(new Error(failed + " item(s) could not be moved to the trash."));
+                  else resolve();
+                } else pump();
+              });
+          }
+        }
+        pump();
+      });
     });
 }
 
 function restoreFile(key) {
   fetch("/api/trash/restore?key=" + encodeURIComponent(key), { method: "POST" })
-    .then(checkAuth).then(function () { refreshUsage(); refresh(); });
+    .then(checkAuth).then(function (res) {
+      if (res.status === 409) showError("A file with that name is back in its place already: rename it first.");
+      else if (!res.ok) showError("Could not restore the file.");
+      refreshUsage(); refresh();
+    });
 }
 
 function purgeFile(key) {
   if (!confirm("Permanently delete " + key.split("/").pop() + "? This cannot be undone.")) return;
   fetch("/api/trash/object?key=" + encodeURIComponent(key), { method: "DELETE" })
-    .then(checkAuth).then(function () { refreshUsage(); refresh(); });
+    .then(checkAuth).then(function (res) {
+      if (!res.ok) showError("Could not delete the file.");
+      refreshUsage(); refresh();
+    });
 }
 
 // fetch with up to 3 attempts on network errors and 5xx responses.
@@ -4091,10 +4245,20 @@ document.getElementById("bulkDeleteBtn").onclick = function () {
   if (s.files.length) what.push(s.files.length + " file(s)");
   if (s.folders.length) what.push(s.folders.length + " folder(s) and everything inside");
   if (!confirm("Move " + what.join(" and ") + " to the trash?")) return;
-  var jobs = s.files.map(function (k) {
-    return fetch("/api/object?key=" + encodeURIComponent(k), { method: "DELETE" });
-  }).concat(s.folders.map(function (p) { return deleteFolderContents(p); }));
-  Promise.all(jobs).then(function () {
+  var failed = 0;
+  var files = Promise.all(s.files.map(function (k) {
+    return fetchRetry("/api/object?key=" + encodeURIComponent(k), { method: "DELETE" })
+      .then(checkAuth)
+      .then(function (res) { if (!res.ok) failed++; }, function () { failed++; });
+  }));
+  // Folders one after another: each drives the progress bar on its own.
+  var all = s.folders.reduce(function (p, prefix) {
+    return p.then(function () {
+      return deleteFolderContents(prefix).catch(function (err) { failed++; showError(err.message); });
+    });
+  }, files);
+  all.then(function () {
+    if (failed) showError("Some items could not be moved to the trash.");
     clearSelection();
     initTree();
     refreshUsage();
