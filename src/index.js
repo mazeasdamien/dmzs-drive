@@ -10,7 +10,8 @@
 //   POST /api/login {password, code}      -> sets session cookie (public)
 //   POST /api/logout                      -> clears the cookie
 //   GET  /api/list?prefix=foo/            -> { prefix, folders: [...], files: [...] }
-//   PUT  /api/object?key=foo/bar.txt      -> upload (body = file contents)
+//   PUT  /api/object?key=foo/bar.txt      -> upload (body = file contents); 409 if it
+//                                            exists, unless &replace=1 (old one to .trash/)
 //   GET  /api/object?key=foo/bar.txt      -> download
 //   DELETE /api/object?key=foo/bar.txt    -> soft-delete (moves into .trash/)
 //   POST /api/mkdir?key=foo/bar/          -> create an empty folder
@@ -51,105 +52,47 @@ const MANIFEST = {
   ],
 };
 
+// Stored files are served with this: whatever a file turns out to contain, it
+// can't run script or load anything when opened directly.
+const FILE_CSP = "sandbox; default-src 'none'; img-src 'self' data:; media-src 'self'; style-src 'unsafe-inline'";
+
+// The two pages' own CSP. Their scripts are inline, so they're allowed by
+// hash (worked out once per isolate from the page text) rather than with
+// 'unsafe-inline'; anything injected would have no hash and not run.
+const pageCsp = new Map();
+async function cspFor(html) {
+  if (pageCsp.has(html)) return pageCsp.get(html);
+  const hashes = [];
+  for (const m of html.matchAll(/<script>([\s\S]*?)<\/script>/g)) {
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(m[1]));
+    hashes.push("'sha256-" + btoa(String.fromCharCode(...new Uint8Array(digest))) + "'");
+  }
+  const csp = [
+    "default-src 'self'",
+    "script-src " + hashes.join(" "),
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' blob: data:",
+    "media-src 'self' blob:",
+    "frame-src 'self' https://view.officeapps.live.com",
+    "connect-src 'self'",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "form-action 'self'",
+    "frame-ancestors 'none'",
+  ].join("; ");
+  pageCsp.set(html, csp);
+  return csp;
+}
+
 export default {
   async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-
-    if (url.pathname === "/api/login" && request.method === "POST") {
-      return handleLogin(request, env);
-    }
-
-    // PWA assets are public: they contain nothing sensitive and the browser
-    // fetches the manifest without credentials.
-    if (request.method === "GET") {
-      if (url.pathname === "/manifest.json") {
-        return Response.json(MANIFEST, { headers: { "cache-control": "public, max-age=3600" } });
-      }
-      if (url.pathname === "/icon-192.png") return pngResponse(ICON_192);
-      if (url.pathname === "/icon-512.png") return pngResponse(ICON_512);
-      if (url.pathname === "/apple-touch-icon.png") return pngResponse(APPLE_ICON);
-    }
-
-    // Time-limited signed links: lets the Office preview's external viewer
-    // fetch a document without our session cookie. Signed, single-file, 5 min.
-    if (url.pathname === "/api/object" && request.method === "GET" && url.searchParams.has("sig")) {
-      if (await verifySignedUrl(url, env)) return handleDownload(url, env);
-      return new Response("Invalid or expired link", { status: 403 });
-    }
-
-    if (!(await isAuthed(request, env))) {
-      if (url.pathname.startsWith("/api/")) {
-        return new Response("Unauthorized", { status: 401 });
-      }
-      return htmlResponse(LOGIN_HTML);
-    }
-
-    try {
-      if (url.pathname === "/api/logout" && request.method === "POST") {
-        return handleLogout();
-      }
-      if (url.pathname === "/api/list" && request.method === "GET") {
-        return await handleList(url, env);
-      }
-      if (url.pathname === "/api/object") {
-        if (request.method === "PUT") return await handleUpload(request, url, env);
-        if (request.method === "GET") return await handleDownload(url, env);
-        if (request.method === "DELETE") return await handleSoftDelete(url, env);
-      }
-      if (url.pathname === "/api/thumb" && request.method === "GET") {
-        return await handleThumb(request, url, env, ctx);
-      }
-      if (url.pathname === "/api/mkdir" && request.method === "POST") {
-        return await handleMkdir(url, env);
-      }
-      if (url.pathname === "/api/sign" && request.method === "GET") {
-        return await handleSign(url, env);
-      }
-      if (url.pathname === "/api/rename" && request.method === "POST") {
-        return await handleRename(url, env);
-      }
-      if (url.pathname === "/api/keys" && request.method === "GET") {
-        return await handleKeys(url, env);
-      }
-      if (url.pathname === "/api/shares" && request.method === "GET") {
-        return await handleSharesList(env);
-      }
-      if (url.pathname === "/api/shares/revoke" && request.method === "POST") {
-        return await handleShareRevoke(url, env);
-      }
-      if (url.pathname === "/api/shares/revokeall" && request.method === "POST") {
-        return await handleShareRevokeAll(env);
-      }
-      if (url.pathname === "/api/search" && request.method === "GET") {
-        return await handleSearch(url, env);
-      }
-      if (url.pathname === "/api/usage" && request.method === "GET") {
-        return await handleUsage(env);
-      }
-      if (url.pathname === "/api/chat" && request.method === "POST") {
-        return await handleChat(request, env, ctx);
-      }
-      if (url.pathname === "/api/chat/usage" && request.method === "GET") {
-        return await handleChatUsage(env);
-      }
-      if (url.pathname === "/api/trash/list" && request.method === "GET") {
-        return await handleTrashList(env);
-      }
-      if (url.pathname === "/api/trash/restore" && request.method === "POST") {
-        return await handleTrashRestore(url, env);
-      }
-      if (url.pathname === "/api/trash/object" && request.method === "DELETE") {
-        return await handleTrashDelete(url, env);
-      }
-      if (url.pathname === "/api/trash/empty" && request.method === "POST") {
-        return await handleTrashEmpty(env);
-      }
-    } catch (err) {
-      return new Response(`Error: ${err.message}`, { status: 500 });
-    }
-
-    // Anything else (including "/") serves the UI.
-    return htmlResponse(HTML);
+    const res = await route(request, env, ctx);
+    // Headers on a fetched or cached response can be read-only: copy first.
+    const out = new Response(res.body, res);
+    out.headers.set("x-content-type-options", "nosniff");
+    out.headers.set("referrer-policy", "same-origin");
+    out.headers.set("strict-transport-security", "max-age=31536000");
+    return out;
   },
 
   // Daily cron: purge old trash entries and expired share-link records.
@@ -178,8 +121,110 @@ export default {
   },
 };
 
-function htmlResponse(body) {
-  return new Response(body, { headers: { "content-type": "text/html;charset=UTF-8" } });
+async function route(request, env, ctx) {
+  const url = new URL(request.url);
+
+  if (url.pathname === "/api/login" && request.method === "POST") {
+    return handleLogin(request, env);
+  }
+
+  // PWA assets are public: they contain nothing sensitive and the browser
+  // fetches the manifest without credentials.
+  if (request.method === "GET") {
+    if (url.pathname === "/manifest.json") {
+      return Response.json(MANIFEST, { headers: { "cache-control": "public, max-age=3600" } });
+    }
+    if (url.pathname === "/icon-192.png") return pngResponse(ICON_192);
+    if (url.pathname === "/icon-512.png") return pngResponse(ICON_512);
+    if (url.pathname === "/apple-touch-icon.png") return pngResponse(APPLE_ICON);
+  }
+
+  // Time-limited signed links: lets the Office preview's external viewer
+  // fetch a document without our session cookie. Signed, single-file, 5 min.
+  if (url.pathname === "/api/object" && request.method === "GET" && url.searchParams.has("sig")) {
+    if (await verifySignedUrl(url, env)) return handleDownload(url, env);
+    return new Response("Invalid or expired link", { status: 403 });
+  }
+
+  if (!(await isAuthed(request, env))) {
+    if (url.pathname.startsWith("/api/")) {
+      return new Response("Unauthorized", { status: 401 });
+    }
+    return htmlResponse(LOGIN_HTML);
+  }
+
+  try {
+    if (url.pathname === "/api/logout" && request.method === "POST") {
+      return handleLogout();
+    }
+    if (url.pathname === "/api/list" && request.method === "GET") {
+      return await handleList(url, env);
+    }
+    if (url.pathname === "/api/object") {
+      if (request.method === "PUT") return await handleUpload(request, url, env);
+      if (request.method === "GET") return await handleDownload(url, env);
+      if (request.method === "DELETE") return await handleSoftDelete(url, env);
+    }
+    if (url.pathname === "/api/thumb" && request.method === "GET") {
+      return await handleThumb(request, url, env, ctx);
+    }
+    if (url.pathname === "/api/mkdir" && request.method === "POST") {
+      return await handleMkdir(url, env);
+    }
+    if (url.pathname === "/api/sign" && request.method === "GET") {
+      return await handleSign(url, env);
+    }
+    if (url.pathname === "/api/rename" && request.method === "POST") {
+      return await handleRename(url, env);
+    }
+    if (url.pathname === "/api/keys" && request.method === "GET") {
+      return await handleKeys(url, env);
+    }
+    if (url.pathname === "/api/shares" && request.method === "GET") {
+      return await handleSharesList(env);
+    }
+    if (url.pathname === "/api/shares/revoke" && request.method === "POST") {
+      return await handleShareRevoke(url, env);
+    }
+    if (url.pathname === "/api/shares/revokeall" && request.method === "POST") {
+      return await handleShareRevokeAll(env);
+    }
+    if (url.pathname === "/api/search" && request.method === "GET") {
+      return await handleSearch(url, env);
+    }
+    if (url.pathname === "/api/usage" && request.method === "GET") {
+      return await handleUsage(env);
+    }
+    if (url.pathname === "/api/chat" && request.method === "POST") {
+      return await handleChat(request, env, ctx);
+    }
+    if (url.pathname === "/api/chat/usage" && request.method === "GET") {
+      return await handleChatUsage(env);
+    }
+    if (url.pathname === "/api/trash/list" && request.method === "GET") {
+      return await handleTrashList(env);
+    }
+    if (url.pathname === "/api/trash/restore" && request.method === "POST") {
+      return await handleTrashRestore(url, env);
+    }
+    if (url.pathname === "/api/trash/object" && request.method === "DELETE") {
+      return await handleTrashDelete(url, env);
+    }
+    if (url.pathname === "/api/trash/empty" && request.method === "POST") {
+      return await handleTrashEmpty(env);
+    }
+  } catch (err) {
+    return new Response(`Error: ${err.message}`, { status: 500 });
+  }
+
+  // Anything else (including "/") serves the UI.
+  return htmlResponse(HTML);
+}
+
+async function htmlResponse(body) {
+  return new Response(body, {
+    headers: { "content-type": "text/html;charset=UTF-8", "content-security-policy": await cspFor(body) },
+  });
 }
 
 function pngResponse(b64) {
@@ -454,6 +499,15 @@ async function handleUpload(request, url, env) {
   if (!key) return new Response("Missing key", { status: 400 });
   if (isReserved(key)) return new Response("Reserved prefix", { status: 400 });
 
+  // Never overwrite silently: the client asks first and sends replace=1, and
+  // the version being replaced goes to the trash like a delete would.
+  if (await env.DRIVE_BUCKET.head(key)) {
+    if (url.searchParams.get("replace") !== "1") {
+      return new Response("Target exists", { status: 409 });
+    }
+    await moveObject(env, key, TRASH + key);
+  }
+
   await env.DRIVE_BUCKET.put(key, request.body, {
     httpMetadata: {
       contentType: request.headers.get("content-type") || "application/octet-stream",
@@ -494,8 +548,12 @@ async function handleDownload(url, env) {
       headers.set("content-type", "text/plain;charset=UTF-8");
     }
     headers.set("Content-Disposition", `inline; filename="${filename}"`);
+    // Belt and braces for whatever the type check above misses. PDFs are left
+    // out: a sandboxed response stops the browser's PDF viewer from loading.
+    if (ct !== "application/pdf") headers.set("content-security-policy", FILE_CSP);
   } else {
     headers.set("Content-Disposition", `attachment; filename="${filename}"`);
+    headers.set("content-security-policy", FILE_CSP);
   }
   return new Response(object.body, { headers });
 }
@@ -603,11 +661,21 @@ async function handleThumb(request, url, env, ctx) {
     // For a video it would be megabytes of MP4 in an <img>, so say so instead
     // and let the grid keep its icon.
     if (video) return new Response("No frame", { status: 415 });
+    // Only a real raster image goes back as itself. An HTML or SVG file always
+    // fails the transform, and returned here with its stored type it would
+    // run script on the drive's origin: /api/object downgrades those, this
+    // route must not be the way round that.
+    const type = ((head.httpMetadata || {}).contentType || "").toLowerCase();
+    if (!type.startsWith("image/") || type.includes("svg")) {
+      return new Response("No thumbnail", { status: 415 });
+    }
     const original = await env.DRIVE_BUCKET.get(key);
     if (!original) return new Response("Not found", { status: 404 });
     const headers = new Headers();
     original.writeHttpMetadata(headers);
-    headers.set("cache-control", "public, max-age=3600");
+    headers.set("content-type", type);
+    headers.set("content-security-policy", FILE_CSP);
+    headers.set("cache-control", "private, max-age=3600");
     headers.set("x-thumb", "original"); // no resize happened
     return new Response(original.body, { headers });
   }
@@ -2577,15 +2645,22 @@ function renameFolder(folder) {
   movePrefixWithProgress(folder, to, input);
 }
 
+// Every listing (folder, trash, search, shares) bumps this, and a response
+// only renders while it is still the latest: otherwise a slow folder answering
+// after a quicker click paints its files under the other one's breadcrumb.
+var listGen = 0;
+
 function load(prefix, fromHistory) {
   currentPrefix = prefix;
   if (!fromHistory) pushPrefixHash(prefix);
   clearSelection();
   renderBreadcrumb();
+  var gen = ++listGen;
   return fetch("/api/list?prefix=" + encodeURIComponent(prefix))
     .then(checkAuth)
     .then(function (res) { return res.json(); })
     .then(function (data) {
+      if (gen !== listGen) return;
       sortList(data.folders,
         function (f) { return f.prefix; },
         function (f) { return f.size; },
@@ -2794,10 +2869,12 @@ function renderGrid(data, prefix) {
 function loadTrash() {
   showListLayout();
   renderBreadcrumb();
+  var gen = ++listGen;
   return fetch("/api/trash/list")
     .then(checkAuth)
     .then(function (res) { return res.json(); })
     .then(function (data) {
+      if (gen !== listGen) return;
       var rows = document.getElementById("rows");
       rows.innerHTML = "";
 
@@ -2831,11 +2908,12 @@ function refresh() {
 function loadShares() {
   showListLayout();
   renderBreadcrumb();
+  var gen = ++listGen;
   return fetch("/api/shares")
     .then(checkAuth)
     .then(function (res) { return res.json(); })
     .then(function (data) {
-      if (mode !== "shares") return;
+      if (gen !== listGen) return;
       var rows = document.getElementById("rows");
       rows.innerHTML = "";
       lastFiles = [];
@@ -3233,11 +3311,13 @@ function loadSearch() {
   clearSelection();
   showListLayout();
   renderBreadcrumb();
+  var gen = ++listGen;
   return fetch("/api/search?q=" + encodeURIComponent(searchQuery))
     .then(checkAuth)
     .then(function (res) { return res.json(); })
     .then(function (data) {
-      if (mode !== "search") return; // user navigated away while we were fetching
+      // Navigated away, or typed further, while this was in flight.
+      if (gen !== listGen) return;
       var rows = document.getElementById("rows");
       rows.innerHTML = "";
       sortList(data.files,
@@ -3713,7 +3793,44 @@ function putRetry(url, file, onProgress, tries) {
   });
 }
 
+// Which of the files about to be uploaded already exist. The current listing
+// answers for files dropped straight into this folder; a picked or dropped
+// folder is looked up by its own prefix, so a big drive isn't listed whole.
+function existingKeys(dest, items) {
+  var found = {};
+  Object.keys(fileMeta).forEach(function (k) { found[k] = true; });
+  var tops = {};
+  items.forEach(function (it) {
+    var slash = it.relPath.indexOf("/");
+    if (slash !== -1) tops[it.relPath.slice(0, slash + 1)] = true;
+  });
+  return Promise.all(Object.keys(tops).map(function (top) {
+    return fetch("/api/keys?prefix=" + encodeURIComponent(dest + top))
+      .then(checkAuth)
+      .then(function (res) { return res.ok ? res.json() : { keys: [] }; })
+      .then(function (data) { data.keys.forEach(function (k) { found[k] = true; }); });
+  })).then(function () { return found; });
+}
+
 function uploadItems(items) {
+  // Fixed when the upload starts: browsing to another folder meanwhile must
+  // not send the remaining files there.
+  var dest = currentPrefix;
+  existingKeys(dest, items).catch(function () { return {}; }).then(function (existing) {
+    var clash = items.filter(function (it) { return existing[dest + it.relPath]; });
+    if (clash.length) {
+      var names = clash.slice(0, 5).map(function (it) { return it.relPath; }).join("\n") +
+        (clash.length > 5 ? "\n…" : "");
+      var replace = confirm(clash.length + " file(s) already exist here:\n" + names +
+        "\n\nOK replaces them (the old versions go to the trash). Cancel skips them.");
+      if (replace) clash.forEach(function (it) { it.replace = true; });
+      else items = items.filter(function (it) { return clash.indexOf(it) === -1; });
+    }
+    if (items.length) sendItems(dest, items);
+  });
+}
+
+function sendItems(dest, items) {
   var i = 0;
   var failed = [];
   // The bar counts bytes, not files: with a single file the file counter never
@@ -3743,9 +3860,12 @@ function uploadItems(items) {
     }
     var it = items[i];
     show(it, 0);
-    putRetry("/api/object?key=" + encodeURIComponent(currentPrefix + it.relPath), it.file,
+    putRetry("/api/object?key=" + encodeURIComponent(dest + it.relPath) + (it.replace ? "&replace=1" : ""), it.file,
       function (sent) { show(it, sent); })
-      .then(function (status) { if (status < 200 || status >= 300) failed.push(it.relPath); })
+      .then(function (status) {
+        if (status === 409) failed.push(it.relPath + " (already exists)");
+        else if (status < 200 || status >= 300) failed.push(it.relPath);
+      })
       .catch(function (err) { if (!err.fatal) failed.push(it.relPath); })
       .then(function () { doneBytes += it.file.size || 0; i++; next(); });
   }
