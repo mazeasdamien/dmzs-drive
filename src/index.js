@@ -90,6 +90,14 @@ async function cspFor(html) {
 export default {
   async fetch(request, env, ctx) {
     const res = await route(request, env, ctx);
+    // Whatever changed the bucket makes the cached index stale. Awaited, not
+    // left to waitUntil: the page lists again straight after, and must not
+    // get the old index back.
+    const url = new URL(request.url);
+    if (!["GET", "HEAD"].includes(request.method) && res.ok && url.pathname.startsWith("/api/") &&
+        !["/api/login", "/api/logout", "/api/chat"].includes(url.pathname)) {
+      await bumpIndex(url.origin);
+    }
     // Headers on a fetched or cached response can be read-only: copy first.
     const out = new Response(res.body, res);
     out.headers.set("x-content-type-options", "nosniff");
@@ -107,6 +115,8 @@ export default {
     for (let i = 0; i < expired.length; i += 1000) {
       await env.DRIVE_BUCKET.delete(expired.slice(i, i + 1000));
     }
+    // The cached bucket index isn't bumped here (its key needs the site's
+    // hostname, which a cron run doesn't have); it expires within INDEX_TTL.
 
     const now = Math.floor(Date.now() / 1000);
     const staleShares = [];
@@ -219,7 +229,7 @@ async function route(request, env, ctx) {
       return await handleSearch(url, env);
     }
     if (url.pathname === "/api/usage" && request.method === "GET") {
-      return await handleUsage(env);
+      return await handleUsage(url, env);
     }
     if (url.pathname === "/api/chat" && request.method === "POST") {
       return await handleChat(request, env, ctx);
@@ -516,6 +526,47 @@ function base32Decode(s) {
 
 // ---------- Drive ----------
 
+// ---------- Bucket index ----------
+//
+// Folder sizes, search and the storage figure all need every object in the
+// bucket, and used to list the whole of it on each request: tens of R2 list
+// calls per click on a big drive. They now share one listing, kept in the
+// Cache API (free) under a "generation" that any change made through this
+// Worker moves on, so the next request rebuilds it. Changes made behind the
+// Worker's back (rclone) show within INDEX_TTL. .config/ is left out.
+const INDEX_TTL = 600;
+
+async function indexGeneration(origin) {
+  const hit = await caches.default.match(origin + "/__internal/index-gen");
+  return hit ? hit.text() : "0";
+}
+
+async function bumpIndex(origin) {
+  await caches.default.put(origin + "/__internal/index-gen", new Response(crypto.randomUUID(), {
+    headers: { "cache-control": "max-age=2592000" },
+  }));
+}
+
+async function bucketIndex(env, origin) {
+  const key = origin + "/__internal/index?g=" + (await indexGeneration(origin));
+  const hit = await caches.default.match(key);
+  if (hit) return hit.json();
+  const all = [];
+  let cursor;
+  do {
+    const page = await env.DRIVE_BUCKET.list({ cursor });
+    for (const o of page.objects) {
+      if (o.key.startsWith(CONFIG)) continue;
+      all.push({ key: o.key, size: o.size, uploaded: new Date(o.uploaded).toISOString() });
+    }
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+  await caches.default.put(key, new Response(JSON.stringify(all), {
+    headers: { "content-type": "application/json", "cache-control": "max-age=" + INDEX_TTL },
+  }));
+  return all;
+}
+
 async function handleList(url, env) {
   const prefix = url.searchParams.get("prefix") || "";
   // R2 returns at most 1000 entries a call: follow the cursor, or a big
@@ -536,25 +587,21 @@ async function handleList(url, env) {
     .sort((a, b) => a.key.localeCompare(b.key));
 
   // R2 "folders" are just key prefixes with no metadata of their own, so
-  // aggregate each subfolder's total size and most recent change from a full
-  // (non-delimited) listing of the subtree.
+  // each subfolder's total size and most recent change are added up from the
+  // bucket index. The folder tree asks with stats=0: it only needs names.
   const stats = {};
-  if (folderNames.length) {
-    let cursor;
-    do {
-      const page = await env.DRIVE_BUCKET.list({ prefix, cursor });
-      for (const o of page.objects) {
-        if (prefix === "" && isReserved(o.key)) continue;
-        const rest = o.key.slice(prefix.length);
-        const slash = rest.indexOf("/");
-        if (slash === -1) continue; // direct file of this level, not in a subfolder
-        const folder = prefix + rest.slice(0, slash + 1);
-        const s = stats[folder] || (stats[folder] = { size: 0, count: 0, modified: null });
-        if (!o.key.endsWith("/")) { s.size += o.size; s.count++; }
-        if (!s.modified || o.uploaded > s.modified) s.modified = o.uploaded;
-      }
-      cursor = page.truncated ? page.cursor : undefined;
-    } while (cursor);
+  if (folderNames.length && url.searchParams.get("stats") !== "0") {
+    for (const o of await bucketIndex(env, url.origin)) {
+      if (!o.key.startsWith(prefix)) continue;
+      if (prefix === "" && isReserved(o.key)) continue;
+      const rest = o.key.slice(prefix.length);
+      const slash = rest.indexOf("/");
+      if (slash === -1) continue; // direct file of this level, not in a subfolder
+      const folder = prefix + rest.slice(0, slash + 1);
+      const s = stats[folder] || (stats[folder] = { size: 0, count: 0, modified: null });
+      if (!o.key.endsWith("/")) { s.size += o.size; s.count++; }
+      if (!s.modified || o.uploaded > s.modified) s.modified = o.uploaded;
+    }
   }
   const folders = folderNames.map((p) => ({
     prefix: p,
@@ -828,33 +875,21 @@ async function handleSearch(url, env) {
   const q = (url.searchParams.get("q") || "").toLowerCase();
   if (!q) return Response.json({ files: [] });
   const files = [];
-  let cursor;
-  do {
-    const page = await env.DRIVE_BUCKET.list({ cursor });
-    for (const o of page.objects) {
-      if (isReserved(o.key) || o.key.endsWith("/")) continue;
-      if (o.key.toLowerCase().includes(q)) {
-        files.push({ key: o.key, size: o.size, uploaded: o.uploaded });
-      }
-    }
-    cursor = page.truncated && files.length < 300 ? page.cursor : undefined;
-  } while (cursor);
+  for (const o of await bucketIndex(env, url.origin)) {
+    if (isReserved(o.key) || o.key.endsWith("/")) continue;
+    if (o.key.toLowerCase().includes(q)) files.push(o);
+    if (files.length >= 300) break;
+  }
   files.sort((a, b) => a.key.localeCompare(b.key));
   return Response.json({ files: files.slice(0, 300) });
 }
 
-async function handleUsage(env) {
+async function handleUsage(url, env) {
   let driveBytes = 0, driveCount = 0, trashBytes = 0;
-  let cursor;
-  do {
-    const page = await env.DRIVE_BUCKET.list({ cursor });
-    for (const o of page.objects) {
-      if (o.key.startsWith(TRASH)) trashBytes += o.size;
-      else if (o.key.startsWith(CONFIG)) continue;
-      else if (!o.key.endsWith("/")) { driveBytes += o.size; driveCount++; }
-    }
-    cursor = page.truncated ? page.cursor : undefined;
-  } while (cursor);
+  for (const o of await bucketIndex(env, url.origin)) {
+    if (o.key.startsWith(TRASH)) trashBytes += o.size;
+    else if (!o.key.endsWith("/")) { driveBytes += o.size; driveCount++; }
+  }
   return Response.json({ driveBytes, driveCount, trashBytes });
 }
 
@@ -3846,7 +3881,7 @@ function treeNode(prefix, name, depth) {
     arrow.textContent = "▾";
     if (loaded) return;
     loaded = true;
-    fetch("/api/list?prefix=" + encodeURIComponent(prefix))
+    fetch("/api/list?stats=0&prefix=" + encodeURIComponent(prefix))
       .then(okJson)
       .then(function (data) {
         data.folders.forEach(function (sub) {
