@@ -1022,7 +1022,8 @@ const LOGIN_HTML = String.raw`<!doctype html>
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
 <title>Damien's Drive — sign in</title>
 <link rel="manifest" href="/manifest.json" />
 <link rel="icon" href="/icon-192.png" type="image/png" />
@@ -1052,6 +1053,10 @@ const LOGIN_HTML = String.raw`<!doctype html>
   /* iOS Safari inflates font sizes in some blocks unless told not to, which
      grows buttons past the width they were laid out for. */
   html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+  /* No zooming, so the installed app feels like an app: manipulation drops
+     double-tap zoom (pinch is blocked in the script, since iOS ignores
+     user-scalable=no). */
+  html { touch-action: manipulation; }
   body {
     margin: 0;
     min-height: 100vh;
@@ -1114,6 +1119,8 @@ const LOGIN_HTML = String.raw`<!doctype html>
   <button type="submit" id="submitBtn">Sign in</button>
 </form>
 <script>
+// iOS ignores user-scalable=no, so pinch zoom is stopped here instead.
+document.addEventListener("gesturestart", function (e) { e.preventDefault(); });
 document.getElementById("loginForm").onsubmit = function (e) {
   e.preventDefault();
   var btn = document.getElementById("submitBtn");
@@ -1147,7 +1154,8 @@ const HTML = String.raw`<!doctype html>
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
 <title>Damien's Drive</title>
 <link rel="manifest" href="/manifest.json" />
 <link rel="icon" href="/icon-192.png" type="image/png" />
@@ -1181,6 +1189,10 @@ const HTML = String.raw`<!doctype html>
   /* iOS Safari inflates font sizes in some blocks unless told not to, which
      grows buttons past the width they were laid out for. */
   html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+  /* No zooming, so the installed app feels like an app: manipulation drops
+     double-tap zoom (pinch is blocked in the script, since iOS ignores
+     user-scalable=no). */
+  html { touch-action: manipulation; }
   body {
     margin: 0;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -1194,6 +1206,10 @@ const HTML = String.raw`<!doctype html>
     flex-wrap: wrap;
     gap: 8px;
     padding: 16px 24px;
+    /* Installed on an iPhone the page runs under the status bar
+       (viewport-fit=cover); the inset keeps the title out from under it.
+       It is 0 everywhere else. */
+    padding-top: calc(16px + env(safe-area-inset-top));
     border-bottom: 1px solid var(--border);
   }
   header h1 { font-size: 16px; margin: 0; font-weight: 600; }
@@ -1448,6 +1464,7 @@ const HTML = String.raw`<!doctype html>
     justify-content: space-between;
     gap: 8px;
     padding: 10px 16px;
+    padding-top: calc(10px + env(safe-area-inset-top));
     background: var(--bg);
     border-bottom: 1px solid var(--border);
   }
@@ -1592,7 +1609,7 @@ const HTML = String.raw`<!doctype html>
        phone nothing is allowed to overflow: the guard below is the backstop,
        and the rules after it are what keep it from being needed. */
     html, body { overflow-x: hidden; }
-    header { padding: 10px 12px; gap: 8px; }
+    header { padding: calc(10px + env(safe-area-inset-top)) 12px 10px; gap: 8px; }
     header h1 { font-size: 15px; }
     main { padding: 14px 12px 96px; }
     /* One row that provably fits at 320px: only the search box flexes, and the
@@ -1620,6 +1637,8 @@ const HTML = String.raw`<!doctype html>
       height: 100vh;
       height: 100dvh;
       max-height: none;
+      padding-top: calc(12px + env(safe-area-inset-top));
+      padding-bottom: calc(12px + env(safe-area-inset-bottom));
       z-index: 12;
       background: var(--bg);
       box-shadow: 0 0 30px rgba(0, 0, 0, .3);
@@ -1653,14 +1672,14 @@ const HTML = String.raw`<!doctype html>
     #selectionBar {
       left: 10px;
       right: 10px;
-      bottom: 10px;
+      bottom: calc(10px + env(safe-area-inset-bottom));
       justify-content: center;
       border-radius: 14px;
       transform: translate(0, 10px);
     }
     #selectionBar.show { transform: none; }
     #selectionBar button { padding: 8px 12px; font-size: 13px; }
-    #previewHeader { flex-wrap: wrap; padding: 8px 10px; }
+    #previewHeader { flex-wrap: wrap; padding: calc(8px + env(safe-area-inset-top)) 10px 8px; }
     #previewHeader button { padding: 8px 12px; }
     #previewBody img, #previewBody video { max-width: 100%; max-height: 100%; }
   }
@@ -1695,6 +1714,7 @@ const HTML = String.raw`<!doctype html>
     justify-content: space-between;
     gap: 8px;
     padding: 12px 16px;
+    padding-top: calc(12px + env(safe-area-inset-top));
     border-bottom: 1px solid var(--border);
   }
   #chatTitle { font-size: 15px; font-weight: 600; }
@@ -1795,7 +1815,7 @@ const HTML = String.raw`<!doctype html>
   .chatSource .srcOpen { margin: 0 0 6px 14px; padding: 3px 10px; font-size: 12px; }
   .chatDocLink { cursor: pointer; color: var(--fg); }
   .chatDocLink:hover { color: var(--accent); }
-  #chatForm { display: flex; align-items: flex-end; gap: 8px; padding: 12px; border-top: 1px solid var(--border); }
+  #chatForm { display: flex; align-items: flex-end; gap: 8px; padding: 12px 12px calc(12px + env(safe-area-inset-bottom)); border-top: 1px solid var(--border); }
   #chatInput {
     flex: 1;
     min-width: 0;
@@ -1813,7 +1833,7 @@ const HTML = String.raw`<!doctype html>
   #chatInput:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
   @media (max-width: 700px) {
     #chatPanel { width: 100vw; border-left: none; }
-    #chatHeader { padding: 10px 12px; }
+    #chatHeader { padding: calc(10px + env(safe-area-inset-top)) 12px 10px; }
     #chatHeader button, #chatForm button { padding: 8px 12px; }
     /* Under 16px, iOS Safari zooms the page in when the field takes focus. */
     #chatInput { font-size: 16px; }
@@ -1910,6 +1930,8 @@ const HTML = String.raw`<!doctype html>
   </form>
 </aside>
 <script>
+// iOS ignores user-scalable=no, so pinch zoom is stopped here instead.
+document.addEventListener("gesturestart", function (e) { e.preventDefault(); });
 var currentPrefix = "";
 var mode = "files"; // "files" | "trash" | "search"
 var searchQuery = "";
