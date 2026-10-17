@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<title>Damien's Drive — sign in</title>
+<link rel="manifest" href="/manifest.json" />
+<link rel="icon" href="/icon-192.png" type="image/png" />
+<link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
+<meta name="theme-color" content="#14161a" media="(prefers-color-scheme: dark)" />
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff;
+    --fg: #1a1a1a;
+    --muted: #6b7280;
+    --border: #e5e7eb;
+    --accent: #2563eb;
+    --danger: #dc2626;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a;
+      --fg: #f1f1f1;
+      --muted: #9aa0a6;
+      --border: #2b2f36;
+      --accent: #5b8cff;
+      --danger: #f87171;
+    }
+  }
+  * { box-sizing: border-box; }
+  /* iOS Safari inflates font sizes in some blocks unless told not to, which
+     grows buttons past the width they were laid out for. */
+  html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+  /* No zooming, so the installed app feels like an app: manipulation drops
+     double-tap zoom (pinch is blocked in the script, since iOS ignores
+     user-scalable=no). */
+  html { touch-action: manipulation; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--fg);
+  }
+  form {
+    width: 100%;
+    max-width: 340px;
+    padding: 32px 28px;
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    margin: 16px;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin: 0 0 24px; }
+  label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 16px; }
+  input {
+    width: 100%;
+    margin-top: 6px;
+    padding: 10px 12px;
+    font: inherit;
+    color: var(--fg);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  input:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
+  button {
+    width: 100%;
+    padding: 10px;
+    font: inherit;
+    font-weight: 600;
+    color: white;
+    background: var(--accent);
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+  }
+  button:disabled { opacity: .6; cursor: default; }
+  #err { color: var(--danger); font-size: 13px; min-height: 18px; margin-bottom: 12px; }
+</style>
+</head>
+<body>
+<form id="loginForm">
+  <h1>Welcome back 👋</h1>
+  <p class="sub">Your personal drive</p>
+  <label>Password
+    <input type="password" id="password" autocomplete="current-password" required autofocus />
+  </label>
+  <label>6-digit code
+    <input id="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6"
+           autocomplete="one-time-code" placeholder="From your authenticator app" required />
+  </label>
+  <div id="err"></div>
+  <button type="submit" id="submitBtn">Sign in</button>
+</form>
+<script>
+// iOS ignores user-scalable=no, so pinch zoom is stopped here instead.
+document.addEventListener("gesturestart", function (e) { e.preventDefault(); });
+document.getElementById("loginForm").onsubmit = function (e) {
+  e.preventDefault();
+  var btn = document.getElementById("submitBtn");
+  var err = document.getElementById("err");
+  btn.disabled = true;
+  err.textContent = "";
+  fetch("/api/login", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      password: document.getElementById("password").value,
+      code: document.getElementById("code").value,
+    }),
+  }).then(function (res) {
+    if (res.ok) { window.location.reload(); return; }
+    btn.disabled = false;
+    err.textContent = res.status === 429
+      ? "Too many attempts. Wait a minute and try again."
+      : "Wrong password or code. Try again.";
+    document.getElementById("code").value = "";
+  }).catch(function () {
+    btn.disabled = false;
+    err.textContent = "Network error. Try again.";
+  });
+};
+</script>
+</body>
+</html>

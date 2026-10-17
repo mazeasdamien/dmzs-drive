@@ -3,11 +3,15 @@
   "private": true,
   "version": "1.0.0",
   "scripts": {
-    "dev": "npx wrangler dev",
-    "deploy": "npx wrangler deploy",
-    "secret": "npx wrangler secret put AUTH_PASS"
+    "dev": "wrangler dev",
+    "deploy": "npm test && wrangler deploy",
+    "test": "node --import ./test/register.mjs --test \"test/*.test.mjs\"",
+    "secret": "wrangler secret put AUTH_PASS"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.131.0"
+  },
+  "devDependencies": {
+    "wrangler": "4.151.1"
   }
 }

@@ -50,6 +50,9 @@
       "simple": { "limit": 8, "period": 60 }
     }
   ],
+  // Workers Logs: requests, console output and errors, kept for a few days
+  // (dashboard → Workers → dmzs-drive → Logs).
+  "observability": { "enabled": true },
   "vars": {
     // Most the "Ask your documents" chat may spend on the Anthropic key in a
     // calendar month, in dollars; past it, questions are refused until the

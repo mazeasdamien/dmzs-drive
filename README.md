@@ -70,13 +70,19 @@ preview them.
 You'll need [Node.js](https://nodejs.org) installed. Then, from this folder:
 
 ```sh
-npm install              # the Anthropic SDK, used by "Ask your documents"
+npm install              # wrangler (pinned) and the Anthropic SDK
 npx wrangler login       # opens a browser to authorize wrangler with your Cloudflare account
 npx wrangler secret put AUTH_PASS     # choose a password — you'll be prompted to type it
 npx wrangler secret put TOTP_SECRET   # base32 seed for the authenticator app (see below)
 npx wrangler secret put ANTHROPIC_API_KEY   # for "Ask your documents" (see below)
-npx wrangler deploy
+npm run deploy           # runs the tests, then wrangler deploy
 ```
+
+`npm test` runs the Worker in Node against an in-memory bucket (`test/`), no
+Cloudflare account needed. The code is split by job: `src/index.js` routes
+requests and sets the security headers, `auth.js`, `drive.js`, `thumbs.js` and
+`chat.js` do the work, and the two pages are plain HTML in `src/pages/`
+(Wrangler imports them as text).
 
 The deploy needs the `drive-ressources` AI Search instance to exist already;
 creating it is described under [Ask your documents](#ask-your-documents).
@@ -197,7 +203,7 @@ hard limit can also be set at console.anthropic.com under Settings → Limits.
 The panel keeps count: a strip under its title shows what the answers have
 cost so far this month and how many questions that was, and each answer shows
 its own cost and token counts. Both are worked out from the token counts the
-API reports and the per-model prices in `CHAT_PRICES` (src/index.js), so they
+API reports and the per-model prices in `CHAT_PRICES` (src/chat.js), so they
 match the Anthropic bill to within rounding; update that table if prices
 change. Monthly totals live in `.config/chat-usage/` in the bucket, so every
 device sees the same figure. An answer stopped halfway is billed but not
