@@ -136,7 +136,19 @@ changes.
 
 Deleting a file moves it into a hidden `.trash/` area instead of destroying it.
 The Trash view in the UI lets you restore or permanently delete entries, and a
-daily cron (see `wrangler.jsonc`) purges anything older than 30 days.
+daily cron (see `wrangler.jsonc`) purges anything older than 30 days. So does
+uploading over an existing file once you've said yes to replacing it: the old
+version goes to the trash. Deleting two files of the same name keeps both
+copies, and a file keeps its date through moves, renames and restores.
+
+### Big files and archives
+
+Uploads past 90 MB go up in 50 MB parts (a Worker takes at most 100 MB per
+request), each part retried on its own. Backup and "Download" on a selection
+build a ZIP in the browser; in Chrome and Edge it's written straight to the
+file you pick, so its size doesn't matter, while other browsers (Safari, all
+of iOS) assemble it in memory and warn past 512 MB. Archives past 4 GiB or
+65,535 files use ZIP64.
 
 ### Ask your documents
 

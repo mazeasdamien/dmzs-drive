@@ -30,10 +30,10 @@ export async function bucketIndex(env, origin) {
   const all = [];
   let cursor;
   do {
-    const page = await env.DRIVE_BUCKET.list({ cursor });
+    const page = await env.DRIVE_BUCKET.list({ cursor, include: ["customMetadata"] });
     for (const o of page.objects) {
       if (o.key.startsWith(CONFIG)) continue;
-      all.push({ key: o.key, size: o.size, uploaded: new Date(o.uploaded).toISOString() });
+      all.push({ key: o.key, size: o.size, uploaded: modifiedOf(o) });
     }
     cursor = page.truncated ? page.cursor : undefined;
   } while (cursor);
@@ -50,7 +50,7 @@ export async function handleList(url, env) {
   const listed = { objects: [], delimitedPrefixes: [] };
   let pageCursor;
   do {
-    const page = await env.DRIVE_BUCKET.list({ prefix, delimiter: "/", cursor: pageCursor });
+    const page = await env.DRIVE_BUCKET.list({ prefix, delimiter: "/", cursor: pageCursor, include: ["customMetadata"] });
     listed.objects.push(...page.objects);
     listed.delimitedPrefixes.push(...(page.delimitedPrefixes || []));
     pageCursor = page.truncated ? page.cursor : undefined;
@@ -59,7 +59,7 @@ export async function handleList(url, env) {
   const folderNames = listed.delimitedPrefixes.filter((p) => p !== TRASH && p !== CONFIG).sort();
   const files = listed.objects
     .filter((o) => o.key !== prefix) // hide the folder's own zero-byte marker, if any
-    .map((o) => ({ key: o.key, size: o.size, uploaded: o.uploaded }))
+    .map((o) => ({ key: o.key, size: o.size, uploaded: modifiedOf(o) }))
     .sort((a, b) => a.key.localeCompare(b.key));
 
   // R2 "folders" are just key prefixes with no metadata of their own, so
@@ -94,14 +94,8 @@ export async function handleUpload(request, url, env) {
   if (!key) return new Response("Missing key", { status: 400 });
   if (isReserved(key)) return new Response("Reserved prefix", { status: 400 });
 
-  // Never overwrite silently: the client asks first and sends replace=1, and
-  // the version being replaced goes to the trash like a delete would.
-  if (await env.DRIVE_BUCKET.head(key)) {
-    if (url.searchParams.get("replace") !== "1") {
-      return new Response("Target exists", { status: 409 });
-    }
-    await moveObject(env, key, TRASH + key);
-  }
+  const refused = await makeRoom(env, key, url);
+  if (refused) return refused;
 
   await env.DRIVE_BUCKET.put(key, request.body, {
     httpMetadata: {
@@ -109,6 +103,60 @@ export async function handleUpload(request, url, env) {
     },
   });
   return new Response("OK");
+}
+
+// Never overwrite silently: the client asks first and sends replace=1, and
+// the version being replaced goes to the trash like a delete would.
+async function makeRoom(env, key, url) {
+  if (!(await env.DRIVE_BUCKET.head(key))) return null;
+  if (url.searchParams.get("replace") !== "1") return new Response("Target exists", { status: 409 });
+  await moveToTrash(env, key);
+  return null;
+}
+
+// Files too big for one request (a Worker takes bodies up to 100 MB) come in
+// parts: create, then each part (the client sends 50 MB at a time), then
+// complete. The overwrite rule is checked when the upload starts and applied
+// when it completes, so an abandoned upload leaves the old file where it was.
+export async function handleMultipart(request, url, env) {
+  const key = url.searchParams.get("key");
+  if (!key) return new Response("Missing key", { status: 400 });
+  if (isReserved(key)) return new Response("Reserved prefix", { status: 400 });
+  const step = url.pathname.slice("/api/upload/".length);
+
+  if (step === "create" && request.method === "POST") {
+    if ((await env.DRIVE_BUCKET.head(key)) && url.searchParams.get("replace") !== "1") {
+      return new Response("Target exists", { status: 409 });
+    }
+    const upload = await env.DRIVE_BUCKET.createMultipartUpload(key, {
+      httpMetadata: { contentType: request.headers.get("x-content-type") || "application/octet-stream" },
+    });
+    return Response.json({ uploadId: upload.uploadId });
+  }
+
+  const uploadId = url.searchParams.get("uploadId");
+  if (!uploadId) return new Response("Missing uploadId", { status: 400 });
+  const upload = env.DRIVE_BUCKET.resumeMultipartUpload(key, uploadId);
+
+  if (step === "part" && request.method === "PUT") {
+    const n = parseInt(url.searchParams.get("part") || "", 10);
+    if (!(n >= 1 && n <= 10000)) return new Response("Bad part number", { status: 400 });
+    const part = await upload.uploadPart(n, request.body);
+    return Response.json({ partNumber: part.partNumber, etag: part.etag });
+  }
+  if (step === "complete" && request.method === "POST") {
+    const { parts } = await request.json();
+    if (!Array.isArray(parts) || !parts.length) return new Response("Missing parts", { status: 400 });
+    const refused = await makeRoom(env, key, url);
+    if (refused) return refused;
+    await upload.complete(parts);
+    return new Response("OK");
+  }
+  if (step === "abort" && request.method === "POST") {
+    await upload.abort();
+    return new Response("OK");
+  }
+  return new Response("Not found", { status: 404 });
 }
 
 export async function handleDownload(request, url, env) {
@@ -180,7 +228,7 @@ export async function handleSoftDelete(url, env) {
   const key = url.searchParams.get("key");
   if (!key) return new Response("Missing key", { status: 400 });
   if (isReserved(key)) return new Response("Use /api/trash/*", { status: 400 });
-  await moveObject(env, key, TRASH + key);
+  await moveToTrash(env, key);
   return new Response("OK");
 }
 
@@ -255,7 +303,7 @@ export async function handleTrashList(env) {
     .filter((o) => !o.key.endsWith("/")) // hide folder markers
     .map((o) => ({
       key: o.key,
-      original: o.key.slice(TRASH.length),
+      original: originalOf(o),
       size: o.size,
       deleted: o.uploaded, // moving into the trash resets the upload time
     }))
@@ -266,11 +314,13 @@ export async function handleTrashList(env) {
 export async function handleTrashRestore(url, env) {
   const key = url.searchParams.get("key");
   if (!key || !key.startsWith(TRASH)) return new Response("Bad key", { status: 400 });
-  const dest = key.slice(TRASH.length);
+  const entry = await env.DRIVE_BUCKET.head(key);
+  if (!entry) return new Response("Not found", { status: 404 });
+  const dest = originalOf(entry);
   if (await env.DRIVE_BUCKET.head(dest)) {
     return new Response("Target exists", { status: 409 }); // never overwrite silently
   }
-  await moveObject(env, key, dest);
+  await moveObject(env, key, dest, { original: null });
   return new Response("OK");
 }
 
@@ -293,7 +343,7 @@ export async function listAllTrash(env) {
   const out = [];
   let cursor;
   do {
-    const page = await env.DRIVE_BUCKET.list({ prefix: TRASH, cursor });
+    const page = await env.DRIVE_BUCKET.list({ prefix: TRASH, cursor, include: ["customMetadata"] });
     out.push(...page.objects);
     cursor = page.truncated ? page.cursor : undefined;
   } while (cursor);
@@ -301,18 +351,45 @@ export async function listAllTrash(env) {
 }
 
 // R2 has no server-side copy in the binding API; stream the object across.
-// FixedLengthStream keeps this working for objects of any size.
-export async function moveObject(env, from, to) {
+// FixedLengthStream keeps this working for objects of any size. R2 stamps the
+// copy with the time of the move, so the file's own date travels along in
+// its metadata (mtime), with whatever else it carried; `meta` adds to that,
+// and a null value removes a field.
+export async function moveObject(env, from, to, meta = {}) {
   const src = await env.DRIVE_BUCKET.get(from);
   if (!src) return;
+  const customMetadata = { ...(src.customMetadata || {}), mtime: modifiedOf(src), ...meta };
+  for (const k of Object.keys(customMetadata)) if (customMetadata[k] === null) delete customMetadata[k];
+  const opts = { httpMetadata: src.httpMetadata, customMetadata };
   if (src.size === 0) {
-    await env.DRIVE_BUCKET.put(to, new Uint8Array(), { httpMetadata: src.httpMetadata });
+    await env.DRIVE_BUCKET.put(to, new Uint8Array(), opts);
   } else {
     const { readable, writable } = new FixedLengthStream(src.size);
     await Promise.all([
       src.body.pipeTo(writable),
-      env.DRIVE_BUCKET.put(to, readable, { httpMetadata: src.httpMetadata }),
+      env.DRIVE_BUCKET.put(to, readable, opts),
     ]);
   }
   await env.DRIVE_BUCKET.delete(from);
+}
+
+// When a file was last really changed: its upload, unless it has been moved
+// since (see moveObject).
+export function modifiedOf(o) {
+  const m = o.customMetadata && o.customMetadata.mtime;
+  return m || new Date(o.uploaded).toISOString();
+}
+
+// Trash entries normally sit at .trash/<original key>. Deleting a second file
+// of the same name used to overwrite the first one's copy there; now the
+// second gets a suffixed key, and every entry records where it came from.
+// (Empty folder markers just replace each other: there's nothing to lose.)
+export async function moveToTrash(env, key) {
+  let to = TRASH + key;
+  if (!key.endsWith("/") && (await env.DRIVE_BUCKET.head(to))) to += "~" + Date.now();
+  await moveObject(env, key, to, { original: key });
+}
+
+export function originalOf(entry) {
+  return (entry.customMetadata && entry.customMetadata.original) || entry.key.slice(TRASH.length);
 }

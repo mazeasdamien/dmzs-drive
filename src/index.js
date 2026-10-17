@@ -13,6 +13,8 @@
 //   PUT  /api/object?key=foo/bar.txt      -> upload (body = file contents); 409 if it
 //                                            exists, unless &replace=1 (old one to .trash/)
 //   GET  /api/object?key=foo/bar.txt      -> download
+//   POST /api/upload/create|complete|abort, PUT /api/upload/part
+//                                         -> uploads over 100 MB, in 50 MB parts
 //   DELETE /api/object?key=foo/bar.txt    -> soft-delete (moves into .trash/)
 //   POST /api/mkdir?key=foo/bar/          -> create an empty folder
 //   GET  /api/trash/list                  -> everything currently in the trash
@@ -29,7 +31,7 @@
 import { ICON_192, ICON_512, APPLE_ICON } from "./icons.js";
 import { SESSIONS, SHARES, TRASH_RETENTION_DAYS } from "./shared.js";
 import { handleLogin, handleLogout, handleShareRevoke, handleShareRevokeAll, handleSharesList, handleSign, isAuthed, verifySignedUrl } from "./auth.js";
-import { bumpIndex, handleDownload, handleKeys, handleList, handleMkdir, handleRename, handleSearch, handleSoftDelete, handleTrashDelete, handleTrashEmpty, handleTrashList, handleTrashRestore, handleUpload, handleUsage, listAllTrash } from "./drive.js";
+import { bumpIndex, handleMultipart, handleDownload, handleKeys, handleList, handleMkdir, handleRename, handleSearch, handleSoftDelete, handleTrashDelete, handleTrashEmpty, handleTrashList, handleTrashRestore, handleUpload, handleUsage, listAllTrash } from "./drive.js";
 import { handleThumb } from "./thumbs.js";
 import { handleChat, handleChatUsage } from "./chat.js";
 import LOGIN_HTML from "./pages/login.html";
@@ -222,6 +224,9 @@ async function route(request, env, ctx) {
       if (request.method === "PUT") return await handleUpload(request, url, env);
       if (request.method === "GET") return await handleDownload(request, url, env);
       if (request.method === "DELETE") return await handleSoftDelete(url, env);
+    }
+    if (url.pathname.startsWith("/api/upload/")) {
+      return await handleMultipart(request, url, env);
     }
     if (url.pathname === "/api/thumb" && request.method === "GET") {
       return await handleThumb(request, url, env, ctx);

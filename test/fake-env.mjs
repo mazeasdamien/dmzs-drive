@@ -46,8 +46,35 @@ export function fakeBucket() {
   const bucket = {
     store,
     listCalls: 0,
-    seed(key, text, type = "text/plain") {
-      store.set(key, { bytes: new TextEncoder().encode(text), type, uploaded: new Date(), version: ++version });
+    seed(key, text, type = "text/plain", uploaded = new Date()) {
+      store.set(key, { bytes: new TextEncoder().encode(text), type, uploaded, version: ++version });
+    },
+    uploads: new Map(),
+    async createMultipartUpload(key, opts = {}) {
+      const uploadId = "up" + ++version;
+      bucket.uploads.set(uploadId, { key, opts, parts: new Map() });
+      return bucket.resumeMultipartUpload(key, uploadId);
+    },
+    resumeMultipartUpload(key, uploadId) {
+      return {
+        uploadId,
+        async uploadPart(n, body) {
+          const u = bucket.uploads.get(uploadId);
+          const bytes = new Uint8Array(await new Response(body).arrayBuffer());
+          u.parts.set(n, bytes);
+          return { partNumber: n, etag: "p" + n + "-" + bytes.length };
+        },
+        async complete(parts) {
+          const u = bucket.uploads.get(uploadId);
+          const chunks = parts.map((p) => u.parts.get(p.partNumber));
+          const all = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+          let at = 0;
+          for (const c of chunks) { all.set(c, at); at += c.length; }
+          await bucket.put(u.key, all, u.opts);
+          bucket.uploads.delete(uploadId);
+        },
+        async abort() { bucket.uploads.delete(uploadId); },
+      };
     },
     async head(k) { const o = store.get(k); return o ? r2Object(k, o) : null; },
     async get(k, opts = {}) {

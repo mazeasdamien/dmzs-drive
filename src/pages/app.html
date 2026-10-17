@@ -2317,10 +2317,20 @@ function refreshUsage() {
     });
 }
 
-// ---- Full-drive backup (ZIP built client-side, stored uncompressed) ----
+// ---- ZIP archives (full backup, and "Download" on a selection) ----
+//
+// Stored (uncompressed) ZIPs assembled in the browser, so the Worker never
+// holds an archive. Each file comes down as a Blob, which browsers keep on
+// disk once it's large, and its CRC is worked out by streaming through it
+// rather than loading it whole. Where the browser can write straight to a file
+// (showSaveFilePicker: Chrome, Edge) the archive goes to disk as it's built
+// and its size doesn't matter; elsewhere it's handed over as one Blob at the
+// end. Past 4 GiB (a file, or the archive) or 65,535 entries the ZIP64
+// extensions take over; ZIP64_AT is a variable so the tests can trigger them.
+var ZIP64_AT = { bytes: 0xffffffff, entries: 0xffff };
 
 var crcTable = null;
-function crc32(data) {
+function crcUpdate(crc, data) {
   if (!crcTable) {
     crcTable = new Uint32Array(256);
     for (var n = 0; n < 256; n++) {
@@ -2329,9 +2339,21 @@ function crc32(data) {
       crcTable[n] = c >>> 0;
     }
   }
-  var crc = 0xffffffff;
   for (var i = 0; i < data.length; i++) crc = crcTable[(crc ^ data[i]) & 0xff] ^ (crc >>> 8);
-  return (crc ^ 0xffffffff) >>> 0;
+  return crc;
+}
+
+function blobCrc(blob) {
+  var reader = blob.stream().getReader();
+  var crc = 0xffffffff;
+  function pump() {
+    return reader.read().then(function (r) {
+      if (r.done) return (crc ^ 0xffffffff) >>> 0;
+      crc = crcUpdate(crc, r.value);
+      return pump();
+    });
+  }
+  return pump();
 }
 
 function dosDateTime(d) {
@@ -2345,8 +2367,7 @@ function dosDateTime(d) {
 
 function listAllFiles(prefix) {
   return fetch("/api/list?prefix=" + encodeURIComponent(prefix))
-    .then(checkAuth)
-    .then(function (r) { return r.json(); })
+    .then(okJson)
     .then(function (data) {
       var subs = data.folders.map(function (f) { return listAllFiles(f.prefix); });
       return Promise.all(subs).then(function (nested) {
@@ -2357,106 +2378,206 @@ function listAllFiles(prefix) {
     });
 }
 
-// Backup and "Download selected" both land here: files are fetched one at a
-// time and appended to a stored (uncompressed) ZIP assembled in the browser, so
-// the Worker never holds an archive in memory. stripPrefix trims a leading
-// folder off the entry names, which keeps a selection's zip flat instead of
-// burying it under the folder it came from.
-function zipFiles(files, zipName, label, stripPrefix) {
-  var enc = new TextEncoder();
+// Where the archive's bytes go: a file on disk when the browser allows it,
+// otherwise parts that become one Blob at the end. Resolves to null if the
+// person cancelled the save dialog. Has to be called straight from the click:
+// the save dialog needs a fresh user gesture.
+function openZipSink(zipName) {
+  if (!window.showSaveFilePicker) return Promise.resolve(blobSink(zipName));
+  return window.showSaveFilePicker({
+    suggestedName: zipName,
+    types: [{ description: "ZIP archive", accept: { "application/zip": [".zip"] } }]
+  }).then(function (handle) {
+    return handle.createWritable();
+  }).then(function (w) {
+    return {
+      toDisk: true,
+      write: function (part) { return w.write(part); },
+      close: function () { return w.close(); },
+      abort: function () { return w.abort(); }
+    };
+  }, function (err) {
+    if (err && err.name === "AbortError") return null;
+    return blobSink(zipName); // not allowed here (gesture expired…): build it in memory instead
+  });
+}
+
+function blobSink(zipName) {
   var parts = [];
-  var central = [];
+  return {
+    toDisk: false,
+    write: function (part) { parts.push(part); return Promise.resolve(); },
+    close: function () {
+      var a = document.createElement("a");
+      a.href = URL.createObjectURL(new Blob(parts, { type: "application/zip" }));
+      a.download = zipName;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 10000);
+      parts = [];
+      return Promise.resolve();
+    },
+    abort: function () { parts = []; return Promise.resolve(); }
+  };
+}
+
+function setU64(dv, pos, n) { dv.setBigUint64(pos, BigInt(n), true); }
+
+// The ZIP64 "extended information" extra field: the listed 8-byte values, in
+// the order the spec wants them (uncompressed size, compressed size, offset).
+function zip64Extra(values) {
+  var dv = new DataView(new ArrayBuffer(4 + 8 * values.length));
+  dv.setUint16(0, 0x0001, true);
+  dv.setUint16(2, 8 * values.length, true);
+  values.forEach(function (v, i) { setU64(dv, 4 + 8 * i, v); });
+  return new Uint8Array(dv.buffer);
+}
+
+function concatBytes(arrays) {
+  var out = new Uint8Array(arrays.reduce(function (n, a) { return n + a.length; }, 0));
+  var at = 0;
+  arrays.forEach(function (a) { out.set(a, at); at += a.length; });
+  return out;
+}
+
+// Fetches the files one at a time into the sink. stripPrefix trims a leading
+// folder off the entry names, which keeps a selection's zip flat instead of
+// burying it under the folder it came from. Resolves when the archive is
+// complete, rejects (after cleaning up) if a file couldn't be fetched.
+function zipFiles(files, sink, label, stripPrefix) {
+  var enc = new TextEncoder();
+  var entries = [];
   var offset = 0;
   var i = 0;
 
-  function next() {
-    if (i >= files.length) { finish(); return; }
-    var f = files[i];
+  function addFile(f) {
     setProgress(label + " " + (i + 1) + "/" + files.length + ": " + f.key, i, files.length);
-    fetchRetry("/api/object?key=" + encodeURIComponent(f.key))
+    return fetchRetry("/api/object?key=" + encodeURIComponent(f.key))
       .then(checkAuth)
       .then(function (r) {
-        if (!r.ok) throw new Error("HTTP " + r.status);
-        return r.arrayBuffer();
+        if (!r.ok) throw new Error("could not download " + f.key + " (HTTP " + r.status + ")");
+        return r.blob();
       })
-      .then(function (buf) {
-        var data = new Uint8Array(buf);
-        var name = f.key;
-        if (stripPrefix && name.indexOf(stripPrefix) === 0) name = name.slice(stripPrefix.length);
-        var nameBytes = enc.encode(name);
-        var crc = crc32(data);
-        // A search or trash selection may carry no upload stamp; dosDateTime
-        // already falls back to now for an invalid date.
-        var dt = dosDateTime(new Date(f.uploaded));
-        var lh = new DataView(new ArrayBuffer(30));
-        lh.setUint32(0, 0x04034b50, true);
-        lh.setUint16(4, 20, true);
-        lh.setUint16(6, 0x0800, true); // UTF-8 file names
-        lh.setUint16(8, 0, true);      // stored, no compression
-        lh.setUint16(10, dt.time, true);
-        lh.setUint16(12, dt.date, true);
-        lh.setUint32(14, crc, true);
-        lh.setUint32(18, data.length, true);
-        lh.setUint32(22, data.length, true);
-        lh.setUint16(26, nameBytes.length, true);
-        lh.setUint16(28, 0, true);
-        parts.push(new Uint8Array(lh.buffer), nameBytes, data);
-        central.push({ name: nameBytes, crc: crc, size: data.length, time: dt.time, date: dt.date, offset: offset });
-        offset += 30 + nameBytes.length + data.length;
-        i++;
-        next();
-      })
-      .catch(function () {
-        hideProgress();
-        alert(label + " aborted: could not download " + f.key + ". Try again.");
+      .then(function (blob) {
+        return blobCrc(blob).then(function (crc) {
+          var name = f.key;
+          if (stripPrefix && name.indexOf(stripPrefix) === 0) name = name.slice(stripPrefix.length);
+          var nameBytes = enc.encode(name);
+          var size = blob.size;
+          var big = size >= ZIP64_AT.bytes;
+          var extra = big ? zip64Extra([size, size]) : new Uint8Array(0);
+          // A search or trash selection may carry no upload stamp; dosDateTime
+          // already falls back to now for an invalid date.
+          var dt = dosDateTime(new Date(f.uploaded));
+          var lh = new DataView(new ArrayBuffer(30));
+          lh.setUint32(0, 0x04034b50, true);
+          lh.setUint16(4, big ? 45 : 20, true);
+          lh.setUint16(6, 0x0800, true); // UTF-8 file names
+          lh.setUint16(8, 0, true);      // stored, no compression
+          lh.setUint16(10, dt.time, true);
+          lh.setUint16(12, dt.date, true);
+          lh.setUint32(14, crc, true);
+          lh.setUint32(18, big ? 0xffffffff : size, true);
+          lh.setUint32(22, big ? 0xffffffff : size, true);
+          lh.setUint16(26, nameBytes.length, true);
+          lh.setUint16(28, extra.length, true);
+          var head = concatBytes([new Uint8Array(lh.buffer), nameBytes, extra]);
+          entries.push({ name: nameBytes, crc: crc, size: size, time: dt.time, date: dt.date, offset: offset });
+          offset += head.length + size;
+          return sink.write(head).then(function () { return sink.write(blob); });
+        });
       });
   }
 
-  function finish() {
+  function centralDirectory() {
     var cdStart = offset;
-    central.forEach(function (c) {
+    var parts = [];
+    entries.forEach(function (c) {
+      var sizeBig = c.size >= ZIP64_AT.bytes;
+      var offBig = c.offset >= ZIP64_AT.bytes;
+      var values = [];
+      if (sizeBig) values.push(c.size, c.size);
+      if (offBig) values.push(c.offset);
+      var extra = values.length ? zip64Extra(values) : new Uint8Array(0);
+      var version = values.length ? 45 : 20;
       var ch = new DataView(new ArrayBuffer(46));
       ch.setUint32(0, 0x02014b50, true);
-      ch.setUint16(4, 20, true);
-      ch.setUint16(6, 20, true);
+      ch.setUint16(4, version, true);
+      ch.setUint16(6, version, true);
       ch.setUint16(8, 0x0800, true);
       ch.setUint16(10, 0, true);
       ch.setUint16(12, c.time, true);
       ch.setUint16(14, c.date, true);
       ch.setUint32(16, c.crc, true);
-      ch.setUint32(20, c.size, true);
-      ch.setUint32(24, c.size, true);
+      ch.setUint32(20, sizeBig ? 0xffffffff : c.size, true);
+      ch.setUint32(24, sizeBig ? 0xffffffff : c.size, true);
       ch.setUint16(28, c.name.length, true);
-      ch.setUint32(42, c.offset, true);
-      parts.push(new Uint8Array(ch.buffer), c.name);
-      offset += 46 + c.name.length;
+      ch.setUint16(30, extra.length, true);
+      ch.setUint32(42, offBig ? 0xffffffff : c.offset, true);
+      parts.push(new Uint8Array(ch.buffer), c.name, extra);
+      offset += 46 + c.name.length + extra.length;
     });
+    var cdSize = offset - cdStart;
+    var count = entries.length;
+    var manyEntries = count >= ZIP64_AT.entries;
+    var farCd = cdStart >= ZIP64_AT.bytes || cdSize >= ZIP64_AT.bytes;
+    if (manyEntries || farCd) {
+      // ZIP64 end of central directory record, then its locator.
+      var z = new DataView(new ArrayBuffer(56));
+      z.setUint32(0, 0x06064b50, true);
+      setU64(z, 4, 44);
+      z.setUint16(12, 45, true);
+      z.setUint16(14, 45, true);
+      setU64(z, 24, count);
+      setU64(z, 32, count);
+      setU64(z, 40, cdSize);
+      setU64(z, 48, cdStart);
+      var loc = new DataView(new ArrayBuffer(20));
+      loc.setUint32(0, 0x07064b50, true);
+      setU64(loc, 8, offset);
+      loc.setUint32(16, 1, true);
+      parts.push(new Uint8Array(z.buffer), new Uint8Array(loc.buffer));
+    }
     var eocd = new DataView(new ArrayBuffer(22));
     eocd.setUint32(0, 0x06054b50, true);
-    eocd.setUint16(8, central.length, true);
-    eocd.setUint16(10, central.length, true);
-    eocd.setUint32(12, offset - cdStart, true);
-    eocd.setUint32(16, cdStart, true);
+    eocd.setUint16(8, manyEntries ? 0xffff : count, true);
+    eocd.setUint16(10, manyEntries ? 0xffff : count, true);
+    eocd.setUint32(12, farCd ? 0xffffffff : cdSize, true);
+    eocd.setUint32(16, farCd ? 0xffffffff : cdStart, true);
     parts.push(new Uint8Array(eocd.buffer));
-
-    var blob = new Blob(parts, { type: "application/zip" });
-    var a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = zipName;
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 10000);
-    hideProgress();
+    return concatBytes(parts);
   }
 
-  next();
+  function next() {
+    if (i >= files.length) {
+      return sink.write(centralDirectory()).then(function () { return sink.close(); });
+    }
+    return addFile(files[i]).then(function () { i++; return next(); });
+  }
+
+  return next().then(hideProgress, function (err) {
+    hideProgress();
+    sink.abort();
+    throw new Error(label + " stopped: " + err.message + ". Try again.");
+  });
 }
 
-function backupDrive() {
-  setProgress("Preparing backup…", 0, 1);
-  listAllFiles("").then(function (files) {
-    if (!files.length) { hideProgress(); alert("Nothing to back up."); return; }
-    zipFiles(files, "drive-backup-" + todayStamp() + ".zip", "Backing up", "");
+// Selections past this, when the archive can only be built in memory, get a
+// warning first: a phone browser can run out of room for it.
+var ZIP_MEMORY_WARN = 512 * 1024 * 1024;
+
+function backupDrive(totalBytes) {
+  openZipSink("drive-backup-" + todayStamp() + ".zip").then(function (sink) {
+    if (!sink) return;
+    if (!sink.toDisk && totalBytes > ZIP_MEMORY_WARN &&
+        !confirm("This browser has to build the " + humanSize(totalBytes) + " archive in memory, which can fail on a phone. Go ahead?")) {
+      return;
+    }
+    setProgress("Preparing backup…", 0, 1);
+    return listAllFiles("").then(function (files) {
+      if (!files.length) { hideProgress(); sink.abort(); alert("Nothing to back up."); return; }
+      return zipFiles(files, sink, "Backing up", "");
+    });
   });
 }
 
@@ -2470,25 +2591,27 @@ function downloadSelected() {
   var picked = splitItems(selected);
   if (!picked.folders.length && picked.files.length === 1) { download(picked.files[0]); return; }
 
-  setProgress("Preparing download…", 0, 1);
   var loose = picked.files.map(function (k) {
     var m = fileMeta[k] || {};
     return { key: k, size: m.size, uploaded: m.uploaded };
   });
-  Promise.all(picked.folders.map(function (p) { return listAllFiles(p); })).then(function (nested) {
-    var files = loose.slice();
-    nested.forEach(function (n) { files = files.concat(n); });
-    if (!files.length) { hideProgress(); alert("Nothing to download — the selected folder is empty."); return; }
-    if (files.length === 1) { hideProgress(); download(files[0].key); return; }
-    // The whole archive is assembled as one Blob, so a huge selection is worth
-    // a warning before the tab tries to hold it all at once.
-    var bytes = files.reduce(function (n, f) { return n + (f.size || 0); }, 0);
-    if (bytes > 512 * 1024 * 1024 &&
-        !confirm("Zip " + files.length + " files (" + humanSize(bytes) + ")? The archive is built in the browser, so it has to fit in memory.")) {
-      hideProgress();
-      return;
-    }
-    zipFiles(files, "drive-selection-" + todayStamp() + ".zip", "Zipping", currentPrefix);
+  openZipSink("drive-selection-" + todayStamp() + ".zip").then(function (sink) {
+    if (!sink) return;
+    setProgress("Preparing download…", 0, 1);
+    return Promise.all(picked.folders.map(function (p) { return listAllFiles(p); })).then(function (nested) {
+      var files = loose.slice();
+      nested.forEach(function (n) { files = files.concat(n); });
+      if (!files.length) { hideProgress(); sink.abort(); alert("Nothing to download — the selected folder is empty."); return; }
+      if (files.length === 1 && !sink.toDisk) { hideProgress(); sink.abort(); download(files[0].key); return; }
+      var bytes = files.reduce(function (n, f) { return n + (f.size || 0); }, 0);
+      if (!sink.toDisk && bytes > ZIP_MEMORY_WARN &&
+          !confirm("Zip " + files.length + " files (" + humanSize(bytes) + ")? This browser builds the archive in memory, which can fail on a phone.")) {
+        hideProgress();
+        sink.abort();
+        return;
+      }
+      return zipFiles(files, sink, "Zipping", currentPrefix);
+    });
   });
 }
 
@@ -2712,7 +2835,9 @@ function hideProgress() {
 // could only ever move the bar between files — drop one big file in and it sat
 // at 0% for the whole transfer, then jumped to done. XHR does report it.
 // Resolves with the HTTP status; rejects only if the request never landed.
-function putWithProgress(url, file, onProgress) {
+// With withBody, resolves {status, body} instead of the bare status (the
+// parts of a big upload answer with the tag the final step needs).
+function putWithProgress(url, file, onProgress, withBody) {
   return new Promise(function (resolve, reject) {
     var xhr = new XMLHttpRequest();
     xhr.open("PUT", url);
@@ -2728,7 +2853,7 @@ function putWithProgress(url, file, onProgress) {
         reject(err);
         return;
       }
-      resolve(xhr.status);
+      resolve(withBody ? { status: xhr.status, body: xhr.responseText } : xhr.status);
     };
     xhr.onerror = function () { reject(new Error("network")); };
     xhr.send(file);
@@ -2736,16 +2861,60 @@ function putWithProgress(url, file, onProgress) {
 }
 
 // Same retry rule as fetchRetry: three tries, for network errors and 5xx only.
-function putRetry(url, file, onProgress, tries) {
+function putRetry(url, file, onProgress, tries, withBody) {
   tries = tries === undefined ? 3 : tries;
-  return putWithProgress(url, file, onProgress).then(function (status) {
+  return putWithProgress(url, file, onProgress, withBody).then(function (r) {
+    var status = withBody ? r.status : r;
     if (status >= 500 && tries > 1) throw new Error("server " + status);
-    return status;
+    return r;
   }).catch(function (err) {
     if (err.fatal || tries <= 1) throw err;
-    onProgress(0); // a retry re-sends the file from the start
+    onProgress(0); // a retry re-sends the file (or the part) from the start
     return new Promise(function (r) { setTimeout(r, 800); }).then(function () {
-      return putRetry(url, file, onProgress, tries - 1);
+      return putRetry(url, file, onProgress, tries - 1, withBody);
+    });
+  });
+}
+
+// A Worker accepts request bodies up to 100 MB, so bigger files go up in
+// 50 MB parts (each retried on its own) and are stitched together by R2 at
+// the end. Resolves with an HTTP status, like putRetry.
+var MULTIPART_AT = 90 * 1024 * 1024;
+var PART_SIZE = 50 * 1024 * 1024;
+function putMultipart(key, file, replace, onProgress) {
+  var q = "?key=" + encodeURIComponent(key) + (replace ? "&replace=1" : "");
+  return fetchRetry("/api/upload/create" + q, {
+    method: "POST",
+    headers: { "x-content-type": file.type || "application/octet-stream" }
+  }).then(checkAuth).then(function (res) {
+    if (!res.ok) return res.status; // 409 (already exists) and the like
+    return res.json().then(function (d) {
+      var base = q + "&uploadId=" + encodeURIComponent(d.uploadId);
+      var count = Math.ceil(file.size / PART_SIZE);
+      var parts = [];
+      function send(n) {
+        if (n > count) {
+          return fetchRetry("/api/upload/complete" + base, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ parts: parts })
+          }).then(checkAuth).then(function (r) { return r.status; });
+        }
+        var start = (n - 1) * PART_SIZE;
+        return putRetry("/api/upload/part" + base + "&part=" + n,
+          file.slice(start, Math.min(file.size, start + PART_SIZE)),
+          function (sent) { onProgress(start + sent); }, 3, true)
+          .then(function (r) {
+            if (r.status < 200 || r.status >= 300) throw new Error("part " + n + ": HTTP " + r.status);
+            parts.push(JSON.parse(r.body));
+            return send(n + 1);
+          });
+      }
+      return send(1).catch(function (err) {
+        // Tell R2 to drop the parts already sent; they'd otherwise linger.
+        fetch("/api/upload/abort" + base, { method: "POST" });
+        throw err;
+      });
     });
   });
 }
@@ -2817,8 +2986,11 @@ function sendItems(dest, items) {
     }
     var it = items[i];
     show(it, 0);
-    putRetry("/api/object?key=" + encodeURIComponent(dest + it.relPath) + (it.replace ? "&replace=1" : ""), it.file,
-      function (sent) { show(it, sent); })
+    var sending = (it.file.size || 0) > MULTIPART_AT
+      ? putMultipart(dest + it.relPath, it.file, it.replace, function (sent) { show(it, sent); })
+      : putRetry("/api/object?key=" + encodeURIComponent(dest + it.relPath) + (it.replace ? "&replace=1" : ""), it.file,
+        function (sent) { show(it, sent); });
+    sending
       .then(function (status) {
         if (status === 409) failed.push(it.relPath + " (already exists)");
         else if (status < 200 || status >= 300) failed.push(it.relPath);
@@ -3031,7 +3203,7 @@ document.getElementById("backupBtn").onclick = function () {
     .then(function (r) { return r.json(); })
     .then(function (u) {
       if (!confirm("Download a full backup of the drive as a ZIP (" + humanSize(u.driveBytes) + ", " + u.driveCount + " files)?")) return;
-      backupDrive();
+      backupDrive(u.driveBytes);
     });
 };
 

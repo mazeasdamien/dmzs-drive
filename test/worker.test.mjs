@@ -153,6 +153,57 @@ test("the chat stops at the monthly budget", async () => {
   assert.equal(res.status, 429);
 });
 
+test("deleting two files of the same name keeps both in the trash", async () => {
+  const { env, as } = await session();
+  env.DRIVE_BUCKET.seed("a.txt", "first");
+  await as("/api/object?key=a.txt", { method: "DELETE" });
+  env.DRIVE_BUCKET.seed("a.txt", "second");
+  await as("/api/object?key=a.txt", { method: "DELETE" });
+  const { files } = await (await as("/api/trash/list")).json();
+  assert.equal(files.length, 2);
+  assert.deepEqual(files.map((f) => f.original), ["a.txt", "a.txt"]);
+  const texts = [];
+  for (const f of files) texts.push(await (await as("/api/object?key=" + encodeURIComponent(f.key))).text());
+  assert.deepEqual(texts.sort(), ["first", "second"]);
+  // The first restore puts a.txt back; the second finds the name taken.
+  assert.equal((await as("/api/trash/restore?key=" + encodeURIComponent(files[1].key), { method: "POST" })).status, 200);
+  assert.equal((await as("/api/trash/restore?key=" + encodeURIComponent(files[0].key), { method: "POST" })).status, 409);
+});
+
+test("moving or restoring a file keeps its date", async () => {
+  const { env, as } = await session();
+  env.DRIVE_BUCKET.seed("old.txt", "x", "text/plain", new Date("2020-05-01T10:00:00Z"));
+  await as("/api/rename?from=old.txt&to=Docs/old.txt", { method: "POST" });
+  const listed = await (await as("/api/list?prefix=Docs/")).json();
+  assert.equal(listed.files[0].uploaded, "2020-05-01T10:00:00.000Z");
+  await as("/api/object?key=Docs/old.txt", { method: "DELETE" });
+  await as("/api/trash/restore?key=" + encodeURIComponent(".trash/Docs/old.txt"), { method: "POST" });
+  const back = await (await as("/api/list?prefix=Docs/")).json();
+  assert.equal(back.files[0].uploaded, "2020-05-01T10:00:00.000Z");
+  assert.equal(env.DRIVE_BUCKET.store.get("Docs/old.txt").meta.original, undefined, "trash bookkeeping is dropped on restore");
+});
+
+test("big files upload in parts, with the same overwrite rule", async () => {
+  const { env, as } = await session();
+  const create = async (q) => as("/api/upload/create?key=big.bin" + q, { method: "POST", headers: { "x-content-type": "application/octet-stream" } });
+  const { uploadId } = await (await create("")).json();
+  const base = "?key=big.bin&uploadId=" + uploadId;
+  const p1 = await (await as("/api/upload/part" + base + "&part=1", { method: "PUT", body: "hello " })).json();
+  const p2 = await (await as("/api/upload/part" + base + "&part=2", { method: "PUT", body: "world" })).json();
+  const done = await as("/api/upload/complete" + base, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ parts: [p1, p2] }),
+  });
+  assert.equal(done.status, 200);
+  assert.equal(await (await as("/api/object?key=big.bin")).text(), "hello world");
+  assert.equal((await create("")).status, 409, "exists: refused without replace");
+  const again = await (await create("&replace=1")).json();
+  const b2 = "?key=big.bin&replace=1&uploadId=" + again.uploadId;
+  const q1 = await (await as("/api/upload/part" + b2 + "&part=1", { method: "PUT", body: "v2" })).json();
+  await as("/api/upload/complete" + b2, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ parts: [q1] }) });
+  assert.equal(await (await as("/api/object?key=big.bin")).text(), "v2");
+  assert.equal(await (await as("/api/object?key=.trash/big.bin")).text(), "hello world");
+});
+
 test("the page's inline script parses", async () => {
   const { as } = await session();
   const html = await (await as("/")).text();
