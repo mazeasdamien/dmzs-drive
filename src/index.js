@@ -23,7 +23,9 @@
 //   POST /api/trash/empty                 -> permanently delete the whole trash
 //   POST /api/chat {messages}             -> answer from the indexed documents (NDJSON stream)
 //   GET  /api/chat/usage                  -> this month's chat cost: {month, questions, cost, ...}
-//   *    everything else                  -> the UI (login page when signed out)
+//   POST /mcp                             -> MCP server (bearer MCP_TOKEN): search_documents,
+//                                            list_documents over Ressources/
+//   *    everything else                 -> the UI (login page when signed out)
 //
 // A daily cron (see wrangler.jsonc "triggers") purges trash entries older
 // than TRASH_RETENTION_DAYS.
@@ -34,6 +36,7 @@ import { handleLogin, handleLogout, handleShareRevoke, handleShareRevokeAll, han
 import { bumpIndex, handleMultipart, handleDownload, handleKeys, handleList, handleMkdir, handleRename, handleSearch, handleSoftDelete, handleTrashDelete, handleTrashEmpty, handleTrashList, handleTrashRestore, handleUpload, handleUsage, listAllTrash } from "./drive.js";
 import { handleThumb } from "./thumbs.js";
 import { handleChat, handleChatUsage } from "./chat.js";
+import { handleMcp } from "./mcp.js";
 import LOGIN_HTML from "./pages/login.html";
 import HTML from "./pages/app.html";
 
@@ -182,6 +185,9 @@ async function route(request, env, ctx) {
   if (url.pathname === "/api/login" && request.method === "POST") {
     return handleLogin(request, env);
   }
+
+  // MCP clients authenticate with their own bearer token, not the cookie.
+  if (url.pathname === "/mcp") return handleMcp(request, env);
 
   // PWA assets are public: they contain nothing sensitive and the browser
   // fetches the manifest without credentials.

@@ -209,3 +209,25 @@ test("the page's inline script parses", async () => {
   const html = await (await as("/")).text();
   for (const m of html.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function(m[1]);
 });
+
+test("MCP needs its token, then searches and lists Ressources/", async () => {
+  const env = makeEnv();
+  env.MCP_TOKEN = "mcp-test-token";
+  env.DOCS_SEARCH = { async search() { return { chunks: [{ text: "Budget 2026: 12 k€", item: { key: "Ressources/a.pdf" } }] }; } };
+  env.DRIVE_BUCKET.seed("Ressources/Orange docs/b.pdf", "x", "application/pdf");
+  const rpc = (body, token = "mcp-test-token") => call(env, "/mcp", {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: "Bearer " + token, "sec-fetch-site": "" },
+    body: JSON.stringify({ jsonrpc: "2.0", ...body }),
+  });
+  assert.equal((await rpc({ id: 1, method: "tools/list" }, "wrong")).status, 401);
+  const init = await (await rpc({ id: 1, method: "initialize", params: {} })).json();
+  assert.equal(init.result.serverInfo.name, "dmzs-drive");
+  assert.equal((await rpc({ method: "notifications/initialized" })).status, 202);
+  const tools = await (await rpc({ id: 2, method: "tools/list" })).json();
+  assert.deepEqual(tools.result.tools.map((t) => t.name), ["search_documents", "list_documents"]);
+  const found = await (await rpc({ id: 3, method: "tools/call", params: { name: "search_documents", arguments: { query: "budget" } } })).json();
+  assert.match(found.result.content[0].text, /a\.pdf[\s\S]*12 k€/);
+  const list = await (await rpc({ id: 4, method: "tools/call", params: { name: "list_documents", arguments: { folder: "Orange docs" } } })).json();
+  assert.match(list.result.content[0].text, /Ressources\/Orange docs\/b\.pdf/);
+});
