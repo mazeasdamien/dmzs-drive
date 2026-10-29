@@ -4,12 +4,13 @@
 // the chat budget: the client's own model reads the passages.
 //
 // Streamable HTTP transport, stateless: every POST /mcp carries one JSON-RPC
-// message and gets a plain JSON reply. Auth is a bearer token (the MCP_TOKEN
-// secret), separate from the browser session so a client never needs the
-// password or a TOTP code.
+// message and gets a plain JSON reply. Auth is a bearer token: either the
+// MCP_TOKEN secret (Claude Code) or an OAuth access token (claude.ai
+// connectors, see oauth.js), never the browser session cookie.
 
 import { safeEqual } from "./auth.js";
 import { fileTitle } from "./chat.js";
+import { isValidAccessToken } from "./oauth.js";
 
 export const MCP_PROTOCOL = "2025-06-18";
 export const DOCS_PREFIX = "Ressources/";
@@ -40,13 +41,16 @@ const TOOLS = [
 ];
 
 export async function handleMcp(request, env) {
-  if (!env.MCP_TOKEN) {
-    return new Response("MCP isn't set up: run npx wrangler secret put MCP_TOKEN.", { status: 503 });
-  }
   const auth = request.headers.get("authorization") || "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-  if (!token || !(await safeEqual(token, env.MCP_TOKEN))) {
-    return new Response("Unauthorized", { status: 401, headers: { "www-authenticate": "Bearer" } });
+  const ok = token && ((env.MCP_TOKEN && (await safeEqual(token, env.MCP_TOKEN))) || (await isValidAccessToken(env, token)));
+  if (!ok) {
+    // Points OAuth clients (claude.ai connectors) at the sign-in flow.
+    const meta = new URL(request.url).origin + "/.well-known/oauth-protected-resource";
+    return new Response("Unauthorized", {
+      status: 401,
+      headers: { "www-authenticate": `Bearer resource_metadata="${meta}"`, "access-control-allow-origin": "*", "access-control-expose-headers": "www-authenticate" },
+    });
   }
   // Stateless: no server-initiated stream to open, no session to end.
   if (request.method !== "POST") {

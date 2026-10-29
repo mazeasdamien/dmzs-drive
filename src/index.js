@@ -37,6 +37,7 @@ import { bumpIndex, handleMultipart, handleDownload, handleKeys, handleList, han
 import { handleThumb } from "./thumbs.js";
 import { handleChat, handleChatUsage } from "./chat.js";
 import { handleMcp } from "./mcp.js";
+import { OAUTH, corsPreflight, handleAuthorizeApprove, handleAuthorizePage, handleRegister, handleToken, jsonCors, oauthMetadata, resourceMetadata } from "./oauth.js";
 import LOGIN_HTML from "./pages/login.html";
 import HTML from "./pages/app.html";
 
@@ -166,11 +167,38 @@ export default {
     for (let i = 0; i < staleSessions.length; i += 1000) {
       await env.DRIVE_BUCKET.delete(staleSessions.slice(i, i + 1000));
     }
+
+    // OAuth codes and tokens (clients have no expiry and stay).
+    const staleOauth = [];
+    cursor = undefined;
+    do {
+      const page = await env.DRIVE_BUCKET.list({ prefix: OAUTH, cursor, include: ["customMetadata"] });
+      for (const o of page.objects) {
+        const exp = (o.customMetadata || {}).exp;
+        if (exp && parseInt(exp, 10) < now) staleOauth.push(o.key);
+      }
+      cursor = page.truncated ? page.cursor : undefined;
+    } while (cursor);
+    for (let i = 0; i < staleOauth.length; i += 1000) {
+      await env.DRIVE_BUCKET.delete(staleOauth.slice(i, i + 1000));
+    }
   },
 };
 
 async function route(request, env, ctx) {
   const url = new URL(request.url);
+
+  // MCP and the OAuth endpoints behind it carry no cookie (bearer tokens,
+  // PKCE), so they come before the cross-site guard: clients may call them
+  // from another origin.
+  if (request.method === "OPTIONS" && (url.pathname === "/mcp" || url.pathname.startsWith("/oauth/") || url.pathname.startsWith("/.well-known/"))) {
+    return corsPreflight();
+  }
+  if (url.pathname === "/mcp") return handleMcp(request, env);
+  if (url.pathname.startsWith("/.well-known/oauth-protected-resource")) return jsonCors(resourceMetadata(url.origin));
+  if (url.pathname.startsWith("/.well-known/oauth-authorization-server")) return jsonCors(oauthMetadata(url.origin));
+  if (url.pathname === "/oauth/register" && request.method === "POST") return handleRegister(request, env);
+  if (url.pathname === "/oauth/token" && request.method === "POST") return handleToken(request, env);
 
   // Browsers say where a request comes from. Anything that changes state
   // (every non-GET, and /api/sign, which records share links) must come from
@@ -185,9 +213,6 @@ async function route(request, env, ctx) {
   if (url.pathname === "/api/login" && request.method === "POST") {
     return handleLogin(request, env);
   }
-
-  // MCP clients authenticate with their own bearer token, not the cookie.
-  if (url.pathname === "/mcp") return handleMcp(request, env);
 
   // PWA assets are public: they contain nothing sensitive and the browser
   // fetches the manifest without credentials.
@@ -217,6 +242,12 @@ async function route(request, env, ctx) {
       return new Response("Unauthorized", { status: 401 });
     }
     return htmlResponse(LOGIN_HTML);
+  }
+
+  // Signed in: the login page reloads onto the same authorize URL.
+  if (url.pathname === "/oauth/authorize") {
+    if (request.method === "GET") return handleAuthorizePage(url, env);
+    if (request.method === "POST") return handleAuthorizeApprove(request, env);
   }
 
   try {

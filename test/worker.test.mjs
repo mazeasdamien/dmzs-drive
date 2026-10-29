@@ -231,3 +231,43 @@ test("MCP needs its token, then searches and lists Ressources/", async () => {
   const list = await (await rpc({ id: 4, method: "tools/call", params: { name: "list_documents", arguments: { folder: "Orange docs" } } })).json();
   assert.match(list.result.content[0].text, /Ressources\/Orange docs\/b\.pdf/);
 });
+
+test("OAuth: register, approve while signed in, PKCE token, then MCP", async () => {
+  const { env, as } = await session();
+  const s = (path, opts = {}) => call(env, path, { ...opts, headers: { "sec-fetch-site": "cross-site", ...(opts.headers || {}) } });
+  const unauth = await s("/mcp", { method: "POST", body: "{}" });
+  assert.equal(unauth.status, 401);
+  assert.match(unauth.headers.get("www-authenticate"), /resource_metadata=/);
+  assert.equal((await (await s("/.well-known/oauth-authorization-server")).json()).token_endpoint, "https://drive.test/oauth/token");
+
+  const redirect = "https://claude.ai/api/mcp/auth_callback";
+  assert.equal((await s("/oauth/register", { method: "POST", body: JSON.stringify({ redirect_uris: ["https://evil.example/cb"] }) })).status, 400);
+  const { client_id } = await (await s("/oauth/register", { method: "POST", body: JSON.stringify({ redirect_uris: [redirect], client_name: "Claude" }) })).json();
+
+  const verifier = "v".repeat(50);
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)));
+  const challenge = btoa(String.fromCharCode(...digest)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const q = new URLSearchParams({ client_id, redirect_uri: redirect, state: "xyz", code_challenge: challenge, code_challenge_method: "S256", response_type: "code" });
+  assert.doesNotMatch(await (await s("/oauth/authorize?" + q)).text(), /Allow access/); // signed out: login page
+  assert.match(await (await as("/oauth/authorize?" + q)).text(), /Allow access/);
+  const approved = await as("/oauth/authorize", { method: "POST", body: q });
+  const loc = new URL(approved.headers.get("location"));
+  assert.equal(loc.origin + loc.pathname, redirect);
+  assert.equal(loc.searchParams.get("state"), "xyz");
+
+  const tok = (extra) => s("/oauth/token", { method: "POST", body: new URLSearchParams({ client_id, ...extra }) });
+  const code = loc.searchParams.get("code");
+  assert.equal((await tok({ grant_type: "authorization_code", code, redirect_uri: redirect, code_verifier: "wrong" })).status, 400);
+  // The failed try burnt the code: a code is single use.
+  const approved2 = await as("/oauth/authorize", { method: "POST", body: q });
+  const code2 = new URL(approved2.headers.get("location")).searchParams.get("code");
+  const t = await (await tok({ grant_type: "authorization_code", code: code2, redirect_uri: redirect, code_verifier: verifier })).json();
+  assert.ok(t.access_token && t.refresh_token);
+
+  env.DOCS_SEARCH = { async search() { return { chunks: [] }; } };
+  const ok = await s("/mcp", { method: "POST", headers: { authorization: "Bearer " + t.access_token }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) });
+  assert.equal(ok.status, 200);
+  const r = await (await tok({ grant_type: "refresh_token", refresh_token: t.refresh_token })).json();
+  assert.ok(r.access_token);
+  assert.equal((await tok({ grant_type: "refresh_token", refresh_token: t.refresh_token })).status, 400);
+});
