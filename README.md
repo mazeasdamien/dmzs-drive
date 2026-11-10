@@ -1,33 +1,39 @@
 # dmzs-drive
 
-Personal Google-Drive-style storage: a Cloudflare Worker and a single-page UI over a private R2 bucket. About 20 €/month instead of a NAS.
+A private file drive that runs entirely on Cloudflare: one Worker serves the web app and the API, and the files live in an R2 bucket that is never exposed publicly.
 
-## Features
+## What it does
 
-- Upload (multipart for big files), browse, search, preview, rename, move, trash
-- Downloads of whole folders as ZIP64 archives
-- Expiring, revocable share links
-- Thumbnails for photos and videos; installable as an app (PWA)
-- "Ask your documents": AI search and chat over `Ressources/`
-- MCP endpoint with OAuth, so Claude (claude.ai, Desktop, Code) can search `Ressources/`
+- **File manager in the browser**: folder tree, list and grid views, desktop-style selection, drag-and-drop moves, rename, search. Installable as an app (PWA) on mobile.
+- **Previews**: PDFs, images, audio, video and text open in the page. Photos and videos get real thumbnails, generated on the fly and never stored.
+- **Big transfers**: uploads over 90 MB go up in parts. Folders download as one ZIP, built in the browser (ZIP64 past 4 GiB).
+- **Trash**: deleted or replaced files go to a trash that is purged after 30 days.
+- **Share links**: links that expire and can be revoked.
+- **Ask your documents**: a chat that answers from the PDFs and Word files in `Ressources/`, with a citation for every claim (Cloudflare AI Search finds the passages, Claude writes the answer). Monthly spending is capped.
+- **MCP server**: Claude Desktop, Claude Code or claude.ai (through OAuth) can search and list the same `Ressources/` documents. Nothing outside that folder is reachable.
+- **Folder sync**: rclone can mount or sync a local folder straight to the bucket.
 
-## Security
+## How it's built
 
-- Password + TOTP login, `__Host-` session cookie, same-origin check on every write
-- The bucket has no public URL; everything goes through the Worker
-- OAuth: owner approval, PKCE S256, redirects only to claude.ai/claude.com/loopback
-- An OAuth token only opens `/mcp`, and only for `Ressources/`
-- Changing `AUTH_PASS` or `TOTP_SECRET` revokes every session, link and OAuth token
-
-## Deploy
-
-```sh
-npm install
-npx wrangler login
-npx wrangler secret put AUTH_PASS
-npx wrangler secret put TOTP_SECRET
-npx wrangler secret put ANTHROPIC_API_KEY
-npm run deploy   # tests, then wrangler deploy
+```
+browser ─┐
+         ├─▶ Worker (src/index.js) ─▶ R2 bucket
+Claude ──┘     auth · drive · thumbs · chat · mcp · oauth
 ```
 
-Full setup (TOTP enrolment, AI Search, MCP, folder sync): [docs/SETUP.md](docs/SETUP.md).
+There is no database and no build step. The pages are plain HTML in `src/pages/`, and state such as sessions, shares, tokens and the file index lives in the bucket under `.config/`. Sign-in takes a password plus a TOTP code. Tests run in Node against an in-memory bucket (`npm test`).
+
+## What it costs
+
+| Item | Price |
+|---|---|
+| R2 storage | $0.015 per GB per month after the first 10 GB (about $15 per TB). No egress fees. |
+| R2 operations | 1 M writes and 10 M reads free per month; a single user stays well under. |
+| Worker | Free plan (100k requests a day), or $5 a month for Workers Paid. |
+| AI Search | 1,000 searches a month included, then $0.75 per 1,000. |
+| Ask your documents (Claude API) | About $0.05–0.08 a question with Claude Sonnet 5.5, capped by `CHAT_MONTHLY_BUDGET` ($20 a month by default). |
+| MCP | Nothing extra: the connected Claude does the work on its own subscription. |
+
+So the bill is mostly storage, plus whatever the chat is used for.
+
+Setup and deployment: [docs/SETUP.md](docs/SETUP.md).
