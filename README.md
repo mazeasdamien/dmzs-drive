@@ -23,6 +23,16 @@ Claude ──┘     auth · drive · thumbs · chat · mcp · oauth
 
 There is no database and no build step. The pages are plain HTML in `src/pages/`, and state such as sessions, shares, tokens and the file index lives in the bucket under `.config/`. Sign-in takes a password plus a TOTP code. Tests run in Node against an in-memory bucket (`npm test`).
 
+## Security
+
+- **Sign-in**: password plus a TOTP code, and each code works only once. Login attempts are rate limited.
+- **Sessions**: an HttpOnly `__Host-` cookie signed with HMAC and checked against a server record, so logging out really ends the session.
+- **Writes**: any request that changes something is refused unless it comes from the drive's own pages.
+- **Storage**: the bucket has no public URL; every file goes through the Worker. Uploaded HTML and SVG are served as plain text in a sandbox.
+- **Links**: preview links last 5 minutes, and share links expire and can be revoked.
+- **OAuth for Claude**: needs your sign-in and a click on Allow, uses PKCE, and sends codes only to claude.ai, claude.com or localhost. A token opens only `/mcp`, and `/mcp` only reaches `Ressources/`.
+- **Secrets**: they live in Cloudflare (`wrangler secret put`), never in this repo. Changing `AUTH_PASS` or `TOTP_SECRET` revokes every session, link and OAuth token.
+
 ## What it costs
 
 | Item | Price |
