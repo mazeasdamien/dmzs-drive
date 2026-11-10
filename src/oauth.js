@@ -15,6 +15,13 @@
 // daily cron drops the expired ones (customMetadata.exp, like sessions).
 
 import { CONFIG } from "./shared.js";
+import { sessionKey } from "./auth.js";
+
+// Tokens carry a fingerprint of the password and TOTP seed: changing either
+// one revokes every OAuth token, like it does for sessions and links.
+async function generation(env) {
+  return sha256("oauth|" + sessionKey(env));
+}
 
 export const OAUTH = CONFIG + "oauth/";
 const CODE_TTL = 300;
@@ -155,7 +162,7 @@ export async function handleToken(request, env) {
     const key = OAUTH + "refresh/" + (await sha256(p.get("refresh_token") || ""));
     const rec = await readJson(env, key);
     if (rec) await env.DRIVE_BUCKET.delete(key); // rotated on every use
-    if (!rec || rec.exp < now || rec.client_id !== clientId) return jsonCors({ error: "invalid_grant" }, 400);
+    if (!rec || rec.exp < now || rec.client_id !== clientId || rec.gen !== (await generation(env))) return jsonCors({ error: "invalid_grant" }, 400);
     return issueTokens(env, clientId);
   }
 
@@ -166,9 +173,10 @@ async function issueTokens(env, clientId) {
   const now = Math.floor(Date.now() / 1000);
   const access = randomToken(), refresh = randomToken();
   const aExp = now + ACCESS_TTL, rExp = now + REFRESH_TTL;
-  await env.DRIVE_BUCKET.put(OAUTH + "access/" + (await sha256(access)), JSON.stringify({ client_id: clientId, exp: aExp }),
+  const gen = await generation(env);
+  await env.DRIVE_BUCKET.put(OAUTH + "access/" + (await sha256(access)), JSON.stringify({ client_id: clientId, exp: aExp, gen }),
     { customMetadata: { exp: String(aExp) } });
-  await env.DRIVE_BUCKET.put(OAUTH + "refresh/" + (await sha256(refresh)), JSON.stringify({ client_id: clientId, exp: rExp }),
+  await env.DRIVE_BUCKET.put(OAUTH + "refresh/" + (await sha256(refresh)), JSON.stringify({ client_id: clientId, exp: rExp, gen }),
     { customMetadata: { exp: String(rExp) } });
   return jsonCors({ access_token: access, token_type: "Bearer", expires_in: ACCESS_TTL, refresh_token: refresh, scope: "drive" });
 }
@@ -176,7 +184,7 @@ async function issueTokens(env, clientId) {
 export async function isValidAccessToken(env, token) {
   if (!token) return false;
   const rec = await readJson(env, OAUTH + "access/" + (await sha256(token)));
-  return !!rec && rec.exp >= Math.floor(Date.now() / 1000);
+  return !!rec && rec.exp >= Math.floor(Date.now() / 1000) && rec.gen === (await generation(env));
 }
 
 function randomToken() {

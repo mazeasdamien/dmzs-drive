@@ -1,250 +1,33 @@
 # dmzs-drive
 
-A tiny personal file drive: a Cloudflare Worker + single-page UI backed by the
-`dmzs-drive` R2 bucket (already created in your Cloudflare account). Upload,
-browse with a folder tree, search, preview, rename, move (drag & drop or
-multi-select), share via expiring links, download, and delete — all from a
-browser. Installable as an app (PWA) on mobile, with storage usage shown in
-the sidebar.
+Personal Google-Drive-style storage: a Cloudflare Worker and a single-page UI over a private R2 bucket. About 20 €/month instead of a NAS.
 
-The file list behaves like a desktop file manager: **one click selects, a
-double click opens** — files preview, folders open. Ctrl/Cmd-click adds to the
-selection, Shift-click takes a range, Ctrl/Cmd+A selects everything in the
-folder, Enter opens the selected item, Esc clears, and dragging a box across
-blank space rubber-band-selects whatever it touches (hold Ctrl while dragging
-to add to the current selection). The checkboxes still work too. Folders can be
-selected alongside files, so Move and Delete in the selection bar act on both —
-a folder brings everything inside it along. Dragging any selected item onto a
-folder moves the whole selection.
+## Features
 
-On phones and tablets a single tap still opens, since double-tap is an awkward
-gesture there; use the checkboxes to select several items.
+- Upload (multipart for big files), browse, search, preview, rename, move, trash
+- Downloads of whole folders as ZIP64 archives
+- Expiring, revocable share links
+- Thumbnails for photos and videos; installable as an app (PWA)
+- "Ask your documents": AI search and chat over `Ressources/`
+- MCP endpoint with OAuth, so Claude (claude.ai, Desktop, Code) can search `Ressources/`
 
-A file name too long for its column is cut with an ellipsis and shown whole on
-hover, rather than wrapped — a narrow column used to break a name one letter
-per line and turn every row into a tall stack of characters. Phones wrap
-instead, since there is no hover there to reveal the full name.
+## Security
 
-The four action buttons on a row need about 280px, and in a table that width
-can only come out of the name column, so below 1100px each row folds them into
-a **⋯** menu carrying the same actions.
+- Password + TOTP login, `__Host-` session cookie, same-origin check on every write
+- The bucket has no public URL; everything goes through the Worker
+- OAuth: owner approval, PKCE S256, redirects only to claude.ai/claude.com/loopback
+- An OAuth token only opens `/mcp`, and only for `Ressources/`
+- Changing `AUTH_PASS` or `TOTP_SECRET` revokes every session, link and OAuth token
 
-Below 700px the layout goes fully compact: the folder tree slides in from a
-**☰** button, the toolbar keeps only search, the view toggle and Upload while
-the rest of the actions move into a **⋯** menu, and the grid tiles fold their
-own buttons away the same way the rows already have. Because a touchscreen has
-no hover, the tile checkboxes and action buttons that appear on hover elsewhere
-are shown permanently there, and the drag-and-drop zone (useless from a phone)
-is hidden.
-
-Grid view shows real thumbnails rather than icons. Photos are resized through
-the Images binding; videos get a still frame pulled a second in via the Media
-binding, marked with a ▶ badge. Both read the R2 bytes directly, so the bucket
-stays private, and neither stores anything — the small copies live only in
-Cloudflare's cache, keyed by the object's etag. A video the Media binding can't
-read (an unsupported codec, or over its 100 MB input limit) falls back to a 🎬
-icon.
-
-Nothing on the platform rasterises a PDF or a slide deck, so those can't have
-a real thumbnail. They lean on the icon to say what they are instead — 📕 PDF,
-📘 documents, 📊 spreadsheets, 📙 slides, 📦 archives, 🎵 audio, 📜 code —
-rather than every one of them being the same sheet of paper. Grid and list use
-the same icons.
-
-Previews open in-page: PDFs, images, audio and video render directly in the
-browser. Text files are drawn by the page itself instead of being framed,
-because a browser renders a plain-text document in the colour scheme of the
-page embedding it — which in this dark UI came out as white text on the
-frame's white background, i.e. a preview that looked empty. Rendering it here
-also means the file is only ever inserted as text, so the HTML and SVG the
-Worker downgrades to `text/plain` stay inert; past 2 MB the preview is cut off
-with a pointer to Download.
-
-Word/Excel/PowerPoint files render through Microsoft's embedded Office viewer,
-which fetches the document via a short-lived (5 min) signed link — i.e. those
-documents transit through Microsoft's viewer service when (and only when) you
-preview them.
-
-## 1. Deploy it
-
-You'll need [Node.js](https://nodejs.org) installed. Then, from this folder:
+## Deploy
 
 ```sh
-npm install              # wrangler (pinned) and the Anthropic SDK
-npx wrangler login       # opens a browser to authorize wrangler with your Cloudflare account
-npx wrangler secret put AUTH_PASS     # choose a password — you'll be prompted to type it
-npx wrangler secret put TOTP_SECRET   # base32 seed for the authenticator app (see below)
-npx wrangler secret put ANTHROPIC_API_KEY   # for "Ask your documents" (see below)
-npm run deploy           # runs the tests, then wrangler deploy
+npm install
+npx wrangler login
+npx wrangler secret put AUTH_PASS
+npx wrangler secret put TOTP_SECRET
+npx wrangler secret put ANTHROPIC_API_KEY
+npm run deploy   # tests, then wrangler deploy
 ```
 
-`npm test` runs the Worker in Node against an in-memory bucket (`test/`), no
-Cloudflare account needed. The code is split by job: `src/index.js` routes
-requests and sets the security headers, `auth.js`, `drive.js`, `thumbs.js` and
-`chat.js` do the work, and the two pages are plain HTML in `src/pages/`
-(Wrangler imports them as text).
-
-The deploy needs the `drive-ressources` AI Search instance to exist already;
-creating it is described under [Ask your documents](#ask-your-documents).
-
-The drive is served on the custom domain configured in `wrangler.jsonc`
-(`drive.agentxr.app`). Signing in asks for the password plus a 6-digit code
-from an authenticator app (Microsoft/Google Authenticator, etc.).
-
-To enroll the authenticator: generate a random base32 string (A–Z, 2–7; e.g.
-32 chars), store it as `TOTP_SECRET`, and add it to your authenticator app —
-either by typing it in manually or via a QR code encoding
-`otpauth://totp/dmzs-drive:<your-name>?secret=<TOTP_SECRET>&issuer=dmzs-drive`.
-
-That's it — no build step beyond `npm install`, no database, no separate
-frontend hosting.
-
-### Using a custom domain (optional)
-
-If you have a domain on Cloudflare, you can attach it instead of the `workers.dev`
-URL: Cloudflare dashboard → Workers & Pages → `dmzs-drive` → Settings → Domains &
-Routes → Add a custom domain.
-
-### About the login gate
-
-Every request is checked for a signed session cookie; sessions are created by
-`POST /api/login` with the password **and** a valid TOTP code, and last 30 days.
-Each sign-in also leaves a record in `.config/sessions/`, so Log out really
-ends that session (on every device holding the cookie, within a minute), and a
-6-digit code works for one sign-in only. Requests that change anything are
-refused unless the browser says they came from the drive's own pages.
-
-Login attempts are rate limited to 8 a minute per IP (the `LOGIN_LIMIT` binding
-in `wrangler.jsonc`), checked before the password is, and a failed attempt is
-then slowed by ~800 ms afterwards. Those counters are per Cloudflare location
-and deliberately permissive, so this is a brake rather than an exact quota:
-someone hammering one connection is cut off after a handful of tries (measured:
-six 401s, then 429), while guesses spread thin across locations are only slowed
-by the delay. For a hard zone-wide cap, add a WAF rate-limiting rule on
-`/api/login` in the dashboard — one is included on the free plan. Changing
-either secret invalidates all outstanding sessions.
-
-This repository is public, and nothing in it helps anyone in: the session
-cookie is an HMAC keyed on `AUTH_PASS` + `TOTP_SECRET`, share links are HMACs
-bound to one file and an expiry, and both secrets live only in Cloudflare
-(`wrangler secret put`), never in the source. The R2 bucket has no public URL,
-so its name is of no use without R2 API credentials. If you want more than
-this, Cloudflare Access (Zero Trust) can be layered in front without code
-changes.
-
-### Trash
-
-Deleting a file moves it into a hidden `.trash/` area instead of destroying it.
-The Trash view in the UI lets you restore or permanently delete entries, and a
-daily cron (see `wrangler.jsonc`) purges anything older than 30 days. So does
-uploading over an existing file once you've said yes to replacing it: the old
-version goes to the trash. Deleting two files of the same name keeps both
-copies, and a file keeps its date through moves, renames and restores.
-
-### Big files and archives
-
-Uploads past 90 MB go up in 50 MB parts (a Worker takes at most 100 MB per
-request), each part retried on its own. Backup and "Download" on a selection
-build a ZIP in the browser; in Chrome and Edge it's written straight to the
-file you pick, so its size doesn't matter, while other browsers (Safari, all
-of iOS) assemble it in memory and warn past 512 MB. Archives past 4 GiB or
-65,535 files use ZIP64.
-
-### Ask your documents
-
-The **Ask docs** button opens a chat panel that answers questions from the
-PDFs and Word files under `Ressources/`, citing the passages it relied on:
-each numbered marker opens the document, and the source list under an answer
-expands to show the exact cited text.
-
-Two pieces do the work:
-
-- **Cloudflare AI Search** indexes the files straight from the bucket. It
-  converts each document to text, splits it into chunks and embeds them, then
-  re-syncs on its own (hourly) when files are added or changed. For each
-  question the Worker asks it for the ten closest passages, by meaning and by
-  keyword at once; follow-up questions are rewritten with the earlier turns,
-  so "and in 2025?" still finds the right passages. There is deliberately no
-  reranking step: the available reranker is English-only and scored French
-  passages near zero, which filtered every result out. The search reads the
-  documents' text, not their file names, so ask about what a document says
-  rather than what it is called.
-- **Claude** (`claude-sonnet-5-5`, via the Anthropic API) writes the answer from
-  those passages only. They are passed as search results with citations
-  enabled, so every claim carries a pointer back to its passage, and the
-  model is told to say when the documents don't hold the answer instead of
-  guessing.
-
-The browser keeps the conversation (only the answers' text goes back with
-the next question, not the passages); the Worker stores nothing. The
-retrieved passages, and nothing else from the drive, are sent to the
-Anthropic API with each question.
-
-Setup, once:
-
-1. Create the AI Search instance. In the Cloudflare dashboard: **AI → AI
-   Search → Create instance**, name `drive-ressources`, data source **R2**
-   → bucket `dmzs-drive`, path filters include `Ressources/**/*.pdf` and
-   `Ressources/**/*.docx`, and turn **OCR** on. The dashboard also creates the service token AI Search uses to
-   read the bucket. Or, with a token carrying *AI Search: Edit* (plus *API
-   Tokens: Edit* the first time, for that service token):
-   `npx wrangler ai-search create drive-ressources --type r2 --source dmzs-drive --include-items "Ressources/**/*.pdf" "Ressources/**/*.docx"`,
-   then switch OCR on in the instance's settings.
-2. `npx wrangler secret put ANTHROPIC_API_KEY` with a key from
-   console.anthropic.com. For `npm run dev`, put the same line in `.dev.vars`.
-3. `npx wrangler deploy`. Indexing runs in the background; the instance's
-   Jobs tab in the dashboard shows progress and any file it skipped.
-
-What it can and can't read: PDFs up to 10 MiB with OCR on (4 MiB without),
-and `.docx`, up to 4 MiB. Larger files are skipped and show up in the job
-log, so compress or split them. **PowerPoint files are not supported**:
-export a deck to PDF to make it searchable. Photos and screenshots are left
-out of the index on purpose.
-
-Cost: AI Search includes 5 M indexing tokens, 10 GB of storage and 1,000
-searches a month, which a folder of a few dozen documents stays well within
-(billing starts on 1 November 2026); past 1,000 questions a month, searches
-cost $0.75 per thousand. The Claude side is what you actually pay for, on
-your Anthropic key: each question sends about ten passages plus their
-surrounding context, 15,000–30,000 tokens, and gets back a few thousand, which
-comes to roughly $0.05–0.08 a question with Claude Sonnet 5.5 (about twice
-that with Claude Opus 5.5). The Worker stops taking questions once the month
-has cost `CHAT_MONTHLY_BUDGET` dollars (`wrangler.jsonc`, 20 by default); a
-hard limit can also be set at console.anthropic.com under Settings → Limits.
-
-The panel keeps count: a strip under its title shows what the answers have
-cost so far this month and how many questions that was, and each answer shows
-its own cost and token counts. Both are worked out from the token counts the
-API reports and the per-model prices in `CHAT_PRICES` (src/chat.js), so they
-match the Anthropic bill to within rounding; update that table if prices
-change. Monthly totals live in `.config/chat-usage/` in the bucket, so every
-device sees the same figure. An answer stopped halfway is billed but not
-counted.
-
-## 2. Syncing a folder from your PC
-
-The web UI is for browsing/uploading by hand. For an actual folder that stays in
-sync automatically, use **rclone** — it talks to R2 directly (via R2's S3-compatible
-API), completely independent of the Worker above. Both just read/write the same
-`dmzs-drive` bucket, so anything rclone uploads shows up in the web UI and vice versa.
-
-Steps:
-
-1. **Create R2 API credentials** (rclone needs these; the web UI above doesn't).
-   In the Cloudflare dashboard: R2 → Manage R2 API Tokens → Create API Token →
-   give it read/write access to the `dmzs-drive` bucket only. Save the Access Key
-   ID and Secret Access Key it shows you (shown once).
-2. **Install rclone**: https://rclone.org/install/
-3. **Configure it**: run `rclone config`, choose "New remote", type `s3`, provider
-   `Cloudflare R2`, paste in the Access Key ID / Secret Access Key from step 1, and
-   your Cloudflare account ID (dashboard → right sidebar) for the endpoint.
-4. Then, to keep a folder in sync, either:
-   - **Mount it as a drive** (behaves like a network drive — changes save straight
-     to R2): `rclone mount dmzs-drive-remote:dmzs-drive ~/CloudDrive`
-   - **One-way scheduled sync** (mirrors a local folder up to R2 on a timer, via
-     Task Scheduler on Windows or cron/launchd on Mac): `rclone sync ~/Documents/SyncMe dmzs-drive-remote:dmzs-drive/Documents`
-   - **Two-way sync** (changes on either side propagate both ways):
-     `rclone bisync ~/Documents/SyncMe dmzs-drive-remote:dmzs-drive/Documents`
-
-rclone runs independently of this Worker and of any Claude session — once set up,
-it keeps working in the background on its own.
+Full setup (TOTP enrolment, AI Search, MCP, folder sync): [docs/SETUP.md](docs/SETUP.md).

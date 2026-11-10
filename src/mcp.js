@@ -108,7 +108,8 @@ async function searchDocuments(env, args) {
     messages: [{ role: "user", content: query.slice(0, 2000) }],
     ai_search_options: { retrieval: { max_num_results: max, context_expansion: 1 } },
   });
-  const chunks = (found.chunks || []).filter((c) => c.text && c.item && c.item.key);
+  // Never trust the index config alone: only Ressources/ ever leaves.
+  const chunks = (found.chunks || []).filter((c) => c.text && c.item && typeof c.item.key === "string" && c.item.key.startsWith(DOCS_PREFIX));
   if (!chunks.length) return toolText("No passages matched this query.");
   const text = chunks
     .map((c, i) => `[${i + 1}] ${fileTitle(c.item.key)}\nPath: ${c.item.key}\n\n${c.text.trim()}`)
